@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/llm",
+    "crates/tools",
+    "crates/server",
+    "crates/cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["ForgeClaw Contributors"]
+
+[workspace.dependencies]
+# 内部 crate
+forgeclaw-core = { path = "crates/core" }
+forgeclaw-llm = { path = "crates/llm" }
+forgeclaw-tools = { path = "crates/tools" }
+forgeclaw-server = { path = "crates/server" }
+
+# 异步运行时
+tokio = { version = "1.52", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Web 服务
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors", "compression-full", "timeout"] }
+
+# HTTP 客户端
+# 注：reqwest 0.13 移除了 `rustls-tls` feature，等价为 `rustls`（含 aws-lc-rs provider）
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "charset", "http2", "system-proxy"] }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# 错误处理
+thiserror = "2.0"
+anyhow = "1.0"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ID 与时间
+uuid = { version = "1.23", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4.6", features = ["derive"] }
+rustyline = "18"
+
+# 嵌入资源（为 Task 7 预留）
+rust-embed = "8"
