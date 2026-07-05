@@ -27,13 +27,23 @@ pub struct FunctionCallDto {
     pub arguments: String,
 }
 
+/// 聊天消息角色。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
 /// 一条聊天消息。`role` ∈ `system` / `user` / `assistant` / `tool`。
 ///
 /// 对 `role=tool` 的消息，`tool_call_id` 必填（对应被回复的 tool_call id）；
 /// 其余 role 下为 `None`，序列化时省略以保持字节稳定。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
-    pub role: String,
+    pub role: Role,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDto>>,
@@ -44,7 +54,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: "system".into(),
+            role: Role::System,
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
@@ -53,7 +63,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: "user".into(),
+            role: Role::User,
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
@@ -62,10 +72,19 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: "assistant".into(),
+            role: Role::Assistant,
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+        }
+    }
+
+    pub fn tool(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -209,8 +228,8 @@ mod tests {
         // system 消息不变
         assert_eq!(h.messages()[0], sys_before);
         // 顺序保留
-        assert_eq!(h.messages()[1].role, "user");
-        assert_eq!(h.messages()[2].role, "assistant");
+        assert_eq!(h.messages()[1].role, Role::User);
+        assert_eq!(h.messages()[2].role, Role::Assistant);
     }
 
     #[test]
@@ -273,13 +292,9 @@ mod tests {
 
     #[test]
     fn chatmessage_tool_role_serializes_tool_call_id() {
-        let m = ChatMessage {
-            role: "tool".into(),
-            content: "42".into(),
-            tool_calls: None,
-            tool_call_id: Some("call_1".into()),
-        };
+        let m = ChatMessage::tool("42", "call_1");
         let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains("\"role\":\"tool\""));
         assert!(j.contains("\"tool_call_id\":\"call_1\""));
         assert!(!j.contains("tool_calls"));
     }

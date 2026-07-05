@@ -7,6 +7,9 @@ export default defineConfig({
   // Rust binary via rust-embed (served from an arbitrary sub-path).
   base: './',
   plugins: [vue()],
+  build: {
+    outDir: 'dist',
+  },
   server: {
     proxy: {
       '/api': 'http://localhost:8080',

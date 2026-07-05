@@ -14,7 +14,33 @@ use uuid::Uuid;
 pub struct Session {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
-    pub messages: Vec<Message>,
+    messages: Vec<Message>,
+}
+
+impl Session {
+    /// 构造一个指定 ID、当前时间、空消息的新会话。
+    pub fn new(id: Uuid) -> Self {
+        Self {
+            id,
+            created_at: Utc::now(),
+            messages: Vec::new(),
+        }
+    }
+
+    /// 追加一条消息。
+    pub fn append(&mut self, message: Message) {
+        self.messages.push(message);
+    }
+
+    /// 按原序返回消息切片。
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// 消息数量。
+    pub fn message_count(&self) -> usize {
+        self.messages.len()
+    }
 }
 
 /// 消息种类。

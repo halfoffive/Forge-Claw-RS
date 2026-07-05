@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -323,7 +323,7 @@ pub async fn run_run(cfg: Config, task: String, auto_apply: bool) -> anyhow::Res
 // ============ prompt ============
 
 pub async fn run_prompt_compile(cfg: Config, profile: String) -> anyhow::Result<()> {
-    let mut engine = PromptEngine::new(cfg.prompts_root.clone());
+    let engine = PromptEngine::new(cfg.prompts_root.clone());
     let vars = prompt_vars(&cfg);
     let prompt = engine.compile(&profile, &vars)?;
     print!("{prompt}");
@@ -410,12 +410,13 @@ fn build_tool_input(tool: &str, args: &[String]) -> serde_json::Value {
 
 // ============ web ============
 
-pub async fn run_web(cfg: Config, port: u16) -> anyhow::Result<()> {
+pub async fn run_web(cfg: Config, host: &str, port: u16) -> anyhow::Result<()> {
     let orch = build_orchestrator(&cfg, true)?;
     let users = resolve_users(&cfg);
+    validate_users(&users)?;
     let user_store = UserStore::from_config(users.clone());
-    let state = AppState::new(orch, user_store);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let state = AppState::with_allowed_origins(orch, user_store, cfg.allowed_origins.clone());
+    let addr = parse_bind_addr(host, port)?;
     println!("ForgeClaw Web 服务已启动: http://127.0.0.1:{port}");
     println!(
         "可用用户: {}",
@@ -429,6 +430,28 @@ pub async fn run_web(cfg: Config, port: u16) -> anyhow::Result<()> {
         "登录 POST /api/auth/login {{name, token}}；受保护路由需 Authorization: Bearer <token>"
     );
     server_run(addr, state).await
+}
+
+fn parse_bind_addr(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    let ip: IpAddr = host
+        .parse()
+        .map_err(|_| anyhow::anyhow!("无效的主机地址: {host}"))?;
+    Ok(SocketAddr::from((ip, port)))
+}
+
+fn validate_users(users: &[(String, String)]) -> anyhow::Result<()> {
+    if users.is_empty() {
+        bail!("未配置任何用户，请运行 `forgeclaw config init` 生成 token");
+    }
+    for (name, token) in users {
+        if token.is_empty() {
+            bail!("用户 {name} 的 token 为空，请运行 `forgeclaw config init` 重新生成");
+        }
+        if token == "change-me" || token == "local-token" {
+            bail!("用户 {name} 使用默认/已知 token `{token}`，请运行 `forgeclaw config init` 重新生成");
+        }
+    }
+    Ok(())
 }
 
 /// 解析 web 用户：env `FORGECLAW_USERS` > 配置文件 users > 默认本地用户。
@@ -487,6 +510,14 @@ pub fn run_config_init() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn display_config_value(key: &str, value: &str) -> String {
+    if key == "api_key" {
+        crate::config::mask_key(value)
+    } else {
+        value.to_string()
+    }
+}
+
 pub fn run_config_set(key: &str, value: &str) -> anyhow::Result<()> {
     let mut cfg = crate::config::load_file_or_defaults();
     match key {
@@ -501,13 +532,15 @@ pub fn run_config_set(key: &str, value: &str) -> anyhow::Result<()> {
         ),
     }
     cfg.save()?;
-    println!("已设置 {key} = {value}");
+    let display = display_config_value(key, value);
+    println!("已设置 {key} = {display}");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn build_tool_input_json_object_passthrough() {
@@ -595,5 +628,60 @@ mod tests {
         let names = sb.list();
         assert_eq!(names.len(), 5);
         assert!(names.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn parse_bind_addr_defaults_to_loopback() {
+        let addr = parse_bind_addr("127.0.0.1", 8080).unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn parse_bind_addr_allows_any_interface() {
+        let addr = parse_bind_addr("0.0.0.0", 8080).unwrap();
+        assert!(addr.ip().is_unspecified());
+    }
+
+    #[test]
+    fn parse_bind_addr_rejects_invalid_host() {
+        assert!(parse_bind_addr("not-an-ip", 8080).is_err());
+    }
+
+    #[test]
+    fn validate_users_rejects_weak_tokens() {
+        assert!(validate_users(&[("local".into(), "".into())]).is_err());
+        assert!(validate_users(&[("local".into(), "change-me".into())]).is_err());
+        assert!(validate_users(&[("local".into(), "local-token".into())]).is_err());
+    }
+
+    #[test]
+    fn validate_users_accepts_random_token() {
+        assert!(validate_users(&[("local".into(), Uuid::new_v4().to_string())]).is_ok());
+    }
+
+    #[test]
+    fn default_for_init_uses_random_token() {
+        let cfg = Config::default_for_init();
+        let token = &cfg.users[0].1;
+        assert!(!token.is_empty());
+        assert_ne!(token, "change-me");
+        assert_ne!(token, "local-token");
+    }
+
+    #[test]
+    fn display_config_value_masks_api_key() {
+        assert_eq!(
+            display_config_value("api_key", "sk-abcdef123456"),
+            "sk-a...3456"
+        );
+    }
+
+    #[test]
+    fn display_config_value_passes_through_other_keys() {
+        assert_eq!(
+            display_config_value("model", "deepseek-chat"),
+            "deepseek-chat"
+        );
     }
 }

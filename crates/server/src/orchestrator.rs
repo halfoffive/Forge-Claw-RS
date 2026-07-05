@@ -2,7 +2,7 @@
 //!
 //! 设计要点：
 //! - [`Orchestrator`] 持有 `Arc<dyn LlmClient>` / `Arc<Sandbox>` 与 tool spec 清单，
-//!   `PromptEngine` 用 `tokio::sync::Mutex` 包裹（其 `compile` 为 `&mut self`）。
+//!   `PromptEngine` 的 `compile` 为 `&self`，内部用 `RwLock` 保护缓存，临界区极短。
 //! - [`Orchestrator::run_once`] 为同步阻塞语义：跑完一轮或多轮工具循环后返回最终文本。
 //! - [`Orchestrator::run_streaming`] 通过 `tokio::sync::mpsc` 桥接为事件流，供 WebSocket 用。
 //! - [`Orchestrator::dispatch_subagent`] 用受限沙箱（只读工具）+ 角色 system prompt 隔离上下文。
@@ -71,7 +71,7 @@ pub struct Orchestrator {
     llm: Arc<dyn LlmClient>,
     sandbox: Arc<Sandbox>,
     tool_specs: Arc<Vec<ToolSpec>>,
-    prompt_engine: tokio::sync::Mutex<forgeclaw_core::prompt::PromptEngine>,
+    prompt_engine: forgeclaw_core::prompt::PromptEngine,
     working_dir: PathBuf,
     model: String,
     profile: String,
@@ -91,9 +91,7 @@ impl Orchestrator {
             llm,
             sandbox,
             tool_specs: Arc::new(tool_specs),
-            prompt_engine: tokio::sync::Mutex::new(forgeclaw_core::prompt::PromptEngine::new(
-                prompts_root,
-            )),
+            prompt_engine: forgeclaw_core::prompt::PromptEngine::new(prompts_root),
             working_dir,
             model,
             profile,
@@ -112,16 +110,14 @@ impl Orchestrator {
 
     /// 编译 system prompt（注入 tools/model/cwd 变量）。
     pub async fn compile_prompt(&self, profile: &str) -> anyhow::Result<String> {
-        let mut engine = self.prompt_engine.lock().await;
         let vars = self.prompt_vars();
-        let prompt = engine.compile(profile, &vars)?;
+        let prompt = self.prompt_engine.compile(profile, &vars)?;
         Ok(prompt)
     }
 
     /// 列出 profile 启用的 sections。
     pub async fn list_sections(&self, profile: &str) -> anyhow::Result<Vec<Section>> {
-        let engine = self.prompt_engine.lock().await;
-        let sections = engine.list_sections(profile)?;
+        let sections = self.prompt_engine.list_sections(profile)?;
         Ok(sections)
     }
 
@@ -140,9 +136,8 @@ impl Orchestrator {
     }
 
     async fn compile_system_prompt(&self) -> anyhow::Result<String> {
-        let mut engine = self.prompt_engine.lock().await;
         let vars = self.prompt_vars();
-        let prompt = engine.compile(&self.profile, &vars)?;
+        let prompt = self.prompt_engine.compile(&self.profile, &vars)?;
         Ok(prompt)
     }
 
@@ -162,6 +157,7 @@ impl Orchestrator {
             history,
             user_msg,
             None,
+            25,
         )
         .await
     }
@@ -184,6 +180,7 @@ impl Orchestrator {
             history,
             user_msg,
             Some(&tx),
+            25,
         )
         .await?;
         Ok(())
@@ -209,6 +206,7 @@ impl Orchestrator {
                     &mut history,
                     std::mem::take(&mut msg),
                     None,
+                    25,
                 )
                 .await
             {
@@ -223,7 +221,7 @@ impl Orchestrator {
     /// 核心单轮循环：append user → 反复 (LLM 调用 → 工具执行 → 回填) 直到无工具调用。
     ///
     /// `tx` 为 `Some` 时把流式事件推入 channel。`sandbox` / `tool_specs` 可被
-    /// 覆盖（子代理用受限集合）。
+    /// 覆盖（子代理用受限集合）。`max_turns` 限制 LLM 调用次数，防止死循环烧 token。
     async fn run_turn(
         &self,
         sandbox: &Sandbox,
@@ -231,11 +229,21 @@ impl Orchestrator {
         history: &mut History,
         user_msg: String,
         tx: Option<&mpsc::Sender<OrchestratorEvent>>,
+        max_turns: usize,
     ) -> anyhow::Result<OrchestratorEvent> {
         history.append(ChatMessage::user(user_msg));
         let mut records: Vec<ToolCallRecord> = Vec::new();
 
-        loop {
+        async fn emit(
+            tx: &mpsc::Sender<OrchestratorEvent>,
+            event: OrchestratorEvent,
+        ) -> anyhow::Result<()> {
+            tx.send(event)
+                .await
+                .map_err(|_| anyhow::anyhow!("client disconnected"))
+        }
+
+        for _turn in 0..max_turns {
             let req = ChatRequest::from_history(
                 history,
                 &self.model,
@@ -252,7 +260,7 @@ impl Orchestrator {
                     Event::Delta(s) => {
                         text.push_str(&s);
                         if let Some(tx) = tx {
-                            let _ = tx.send(OrchestratorEvent::Delta { text: s }).await;
+                            emit(tx, OrchestratorEvent::Delta { text: s }).await?;
                         }
                     }
                     Event::ToolCallDelta {
@@ -275,24 +283,19 @@ impl Orchestrator {
                     Event::Done => {}
                     Event::Error(message) => {
                         warn!(%message, "llm stream error event");
+                        let event = OrchestratorEvent::Error { message };
                         if let Some(tx) = tx {
-                            let _ = tx.send(OrchestratorEvent::Error { message }).await;
+                            emit(tx, event.clone()).await?;
                         }
+                        return Ok(event);
                     }
                 }
             }
 
-            let assistant_msg = if tcs.is_empty() {
-                ChatMessage::assistant(&text)
-            } else {
-                let dtos: Vec<ToolCallDto> = tcs.values().map(ToolCallDto::from).collect();
-                ChatMessage {
-                    role: "assistant".into(),
-                    content: text.clone(),
-                    tool_calls: Some(dtos),
-                    tool_call_id: None,
-                }
-            };
+            let mut assistant_msg = ChatMessage::assistant(&text);
+            if !tcs.is_empty() {
+                assistant_msg.tool_calls = Some(tcs.values().map(ToolCallDto::from).collect());
+            }
             history.append(assistant_msg);
 
             if tcs.is_empty() {
@@ -301,51 +304,65 @@ impl Orchestrator {
                     tool_calls: records,
                 };
                 if let Some(tx) = tx {
-                    let _ = tx.send(event.clone()).await;
+                    emit(tx, event.clone()).await?;
                 }
                 return Ok(event);
             }
 
             for agg in tcs.into_values() {
-                let input = parse_tool_input(&agg.arguments);
+                let parsed = parse_tool_input(&agg.arguments);
+                let input_for_start = parsed.as_ref().unwrap_or(&Value::Null).clone();
                 if let Some(tx) = tx {
-                    let _ = tx
-                        .send(OrchestratorEvent::ToolCallStart {
+                    emit(
+                        tx,
+                        OrchestratorEvent::ToolCallStart {
                             name: agg.name.clone(),
-                            input: input.clone(),
-                        })
-                        .await;
+                            input: input_for_start,
+                        },
+                    )
+                    .await?;
                 }
-                let result = match sandbox.execute(&agg.name, input).await {
-                    Ok(r) => r,
-                    Err(e) => ToolResult {
-                        output: String::new(),
-                        error: Some(e.to_string()),
-                        duration_ms: 0,
+                let result = match parsed {
+                    Ok(input) => match sandbox.execute(&agg.name, input).await {
+                        Ok(r) => r,
+                        Err(e) => ToolResult {
+                            output: String::new(),
+                            error: Some(e.to_string()),
+                            duration_ms: 0,
+                        },
                     },
+                    Err(result) => result,
                 };
                 if let Some(tx) = tx {
-                    let _ = tx
-                        .send(OrchestratorEvent::ToolResult {
+                    emit(
+                        tx,
+                        OrchestratorEvent::ToolResult {
                             name: agg.name.clone(),
                             result: result.clone(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await?;
                 }
                 records.push(ToolCallRecord {
                     id: agg.id.clone(),
                     name: agg.name.clone(),
                     result: result.clone(),
                 });
-                let tool_msg = ChatMessage {
-                    role: "tool".into(),
-                    content: result.output,
-                    tool_calls: None,
-                    tool_call_id: Some(agg.id),
+                let tool_content = match &result.error {
+                    Some(e) => format!("error: {}", e),
+                    None => result.output,
                 };
-                history.append(tool_msg);
+                history.append(ChatMessage::tool(tool_content, agg.id));
             }
         }
+
+        let event = OrchestratorEvent::Error {
+            message: "max turns exceeded".into(),
+        };
+        if let Some(tx) = tx {
+            emit(tx, event.clone()).await?;
+        }
+        Ok(event)
     }
 }
 
@@ -369,11 +386,15 @@ impl From<&ToolCallAgg> for ToolCallDto {
     }
 }
 
-fn parse_tool_input(args: &str) -> Value {
+fn parse_tool_input(args: &str) -> Result<Value, ToolResult> {
     if args.trim().is_empty() {
-        return Value::Object(serde_json::Map::new());
+        return Ok(Value::Object(serde_json::Map::new()));
     }
-    serde_json::from_str(args).unwrap_or(Value::Null)
+    serde_json::from_str(args).map_err(|e| ToolResult {
+        output: String::new(),
+        error: Some(format!("invalid arguments json: {} (args={})", e, args)),
+        duration_ms: 0,
+    })
 }
 
 fn subagent_system_prompt(role: SubagentRole) -> String {

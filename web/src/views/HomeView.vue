@@ -1,15 +1,20 @@
-<script setup lang="ts"></script>
+<script setup lang="ts">
+import { onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+
+const router = useRouter()
+const auth = useAuthStore()
+
+onMounted(() => {
+  if (auth.isLoggedIn) {
+    router.replace('/chat')
+  } else {
+    router.replace('/login')
+  }
+})
+</script>
 
 <template>
-  <main class="home">
-    <h1>ForgeClaw</h1>
-    <p>WebUI scaffold. Full pages arrive in Task 7.</p>
-  </main>
+  <div />
 </template>
-
-<style scoped>
-.home {
-  font-family: system-ui, sans-serif;
-  padding: 2rem;
-}
-</style>

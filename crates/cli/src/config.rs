@@ -6,7 +6,11 @@
 
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// CLI 运行配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,10 +42,21 @@ pub struct Config {
     /// `(name, token)` 用户对，供 `web` 子命令构造 UserStore。
     #[serde(default)]
     pub users: Vec<(String, String)>,
+
+    /// CORS 允许的来源列表（供 `web` 子命令）。
+    #[serde(default = "default_allowed_origins")]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_base_url() -> String {
     "https://api.deepseek.com/v1".to_string()
+}
+
+fn default_allowed_origins() -> Vec<String> {
+    vec![
+        "http://localhost:8080".to_string(),
+        "http://127.0.0.1:8080".to_string(),
+    ]
 }
 fn default_model() -> String {
     "deepseek-chat".to_string()
@@ -66,6 +81,7 @@ impl Default for Config {
             working_dir: default_working_dir(),
             profile: default_profile(),
             users: Vec::new(),
+            allowed_origins: default_allowed_origins(),
         }
     }
 }
@@ -83,10 +99,12 @@ impl Config {
         Ok(cfg)
     }
 
-    /// `config init` 用的默认模板（带一个示例本地用户）。
+    /// `config init` 用的默认模板（带一个随机 token 的示例本地用户）。
     pub fn default_for_init() -> Self {
+        let token = Uuid::new_v4().to_string();
+        println!("生成本地用户 token: {token}");
         Self {
-            users: vec![("local".to_string(), "change-me".to_string())],
+            users: vec![("local".to_string(), token)],
             ..Self::default()
         }
     }
@@ -99,6 +117,11 @@ impl Config {
         }
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text)?;
+        #[cfg(unix)]
+        {
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
         Ok(())
     }
 
@@ -130,7 +153,7 @@ pub(crate) fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".forgeclaw").join("config.toml"))
 }
 
-fn mask_key(key: &str) -> String {
+pub(crate) fn mask_key(key: &str) -> String {
     if key.is_empty() {
         return "(未设置)".to_string();
     }
@@ -164,6 +187,10 @@ mod tests {
         assert_eq!(c.working_dir, PathBuf::from("."));
         assert!(c.api_key.is_empty());
         assert!(c.users.is_empty());
+        assert_eq!(
+            c.allowed_origins,
+            vec!["http://localhost:8080", "http://127.0.0.1:8080"]
+        );
     }
 
     #[test]
@@ -183,6 +210,7 @@ mod tests {
             working_dir: PathBuf::from("/tmp/w"),
             profile: "default".into(),
             users: vec![("alice".into(), "tok1".into())],
+            allowed_origins: vec!["http://app.example.com".into()],
         };
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
@@ -190,6 +218,7 @@ mod tests {
         assert_eq!(parsed.model, "m1");
         assert_eq!(parsed.working_dir, PathBuf::from("/tmp/w"));
         assert_eq!(parsed.users, vec![("alice".into(), "tok1".into())]);
+        assert_eq!(parsed.allowed_origins, vec!["http://app.example.com"]);
     }
 
     #[test]
@@ -200,5 +229,24 @@ mod tests {
         assert_eq!(parsed.model, "deepseek-chat");
         assert_eq!(parsed.base_url, "https://api.deepseek.com/v1");
         assert!(parsed.users.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_sets_file_permissions_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::env::set_var("HOME", &home);
+        let cfg = Config {
+            api_key: "sk-test".into(),
+            users: vec![("local".into(), "tok".into())],
+            ..Config::default()
+        };
+        cfg.save().unwrap();
+        let path = home.join(".forgeclaw").join("config.toml");
+        assert!(path.exists());
+        let meta = std::fs::metadata(&path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

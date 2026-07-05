@@ -102,6 +102,10 @@ struct WebArgs {
     /// 监听端口。
     #[arg(long, default_value_t = 8080)]
     port: u16,
+
+    /// 监听主机（默认 127.0.0.1，显式传 0.0.0.0 会暴露到公网）。
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
 }
 
 #[derive(Debug, Parser)]
@@ -155,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
             ToolAction::List => commands::run_tool_list(cfg).await,
             ToolAction::Exec { tool, args } => commands::run_tool_exec(cfg, tool, args).await,
         },
-        Command::Web(a) => commands::run_web(cfg, a.port).await,
+        Command::Web(a) => commands::run_web(cfg, &a.host, a.port).await,
         Command::Config(a) => match a.action {
             ConfigAction::Show => commands::run_config_show(&cfg),
             ConfigAction::Set { key, value } => commands::run_config_set(&key, &value),

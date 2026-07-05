@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use uuid::Uuid;
 use forgeclaw_core::model::{AssistantMsg, Message, Session, ToolCall};
 use forgeclaw_llm::{History, ToolSpec};
 
-use crate::auth::{AuthUser, UserStore};
+use crate::auth::{AuthUser, Ticket, UserStore};
 use crate::orchestrator::{Orchestrator, OrchestratorEvent, ToolCallRecord};
 
 /// 共享应用状态。`Clone` 廉价（仅 `Arc` 引用计数）。
@@ -29,24 +29,57 @@ pub struct AppState {
     pub orchestrator: Arc<Orchestrator>,
     pub sessions: Arc<RwLock<HashMap<Uuid, SessionData>>>,
     pub user_store: Arc<UserStore>,
+    pub tickets: Arc<RwLock<HashMap<Uuid, Ticket>>>,
+    pub allowed_origins: Arc<[HeaderValue]>,
 }
 
 /// 单会话数据：核心 Session（含展示用 messages）+ LLM History（cache-first 前缀）+ 所属用户。
+///
+/// `history` 用 `Arc<RwLock<History>>` 共享，避免并发请求下 read-clone-replace 覆盖消息。
 #[derive(Clone)]
 pub struct SessionData {
     pub session: Session,
-    pub history: History,
+    pub history: Arc<RwLock<History>>,
     pub user_id: Uuid,
 }
 
 impl AppState {
     pub fn new(orchestrator: Arc<Orchestrator>, user_store: UserStore) -> Self {
+        Self::with_allowed_origins(orchestrator, user_store, Vec::new())
+    }
+
+    pub fn with_allowed_origins(
+        orchestrator: Arc<Orchestrator>,
+        user_store: UserStore,
+        allowed_origins: Vec<String>,
+    ) -> Self {
+        let origins: Arc<[HeaderValue]> = if allowed_origins.is_empty() {
+            default_allowed_origins()
+        } else {
+            allowed_origins
+                .into_iter()
+                .map(|o| {
+                    HeaderValue::from_str(&o)
+                        .unwrap_or_else(|_| panic!("invalid allowed origin: {o}"))
+                })
+                .collect()
+        };
         Self {
             orchestrator,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             user_store: Arc::new(user_store),
+            tickets: Arc::new(RwLock::new(HashMap::new())),
+            allowed_origins: origins,
         }
     }
+}
+
+fn default_allowed_origins() -> Arc<[HeaderValue]> {
+    vec![
+        HeaderValue::from_static("http://localhost:8080"),
+        HeaderValue::from_static("http://127.0.0.1:8080"),
+    ]
+    .into()
 }
 
 // ============ DTO ============
@@ -128,37 +161,27 @@ pub async fn chat_handler(
                 return Err((StatusCode::NOT_FOUND, "session not found".into()));
             }
             None => SessionData {
-                session: Session {
-                    id: session_id,
-                    created_at: Utc::now(),
-                    messages: Vec::new(),
-                },
-                history: History::new(),
+                session: Session::new(session_id),
+                history: Arc::new(RwLock::new(History::new())),
                 user_id: user.id,
             },
         }
     };
-    data.session
-        .messages
-        .push(Message::User(req.message.clone()));
+    data.session.append(Message::User(req.message.clone()));
 
-    let event = state
-        .orchestrator
-        .run_once(&mut data.history, req.message)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let event = {
+        let mut history_guard = data.history.write().await;
+        state
+            .orchestrator
+            .run_once(&mut history_guard, req.message)
+            .await
+            .map_err(internal_error)?
+    };
 
     let (text, tool_calls) = match event {
         OrchestratorEvent::Complete { text, tool_calls } => (text, tool_calls),
-        OrchestratorEvent::Error { message } => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, message))
-        }
-        other => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unexpected event: {:?}", other),
-            ))
-        }
+        OrchestratorEvent::Error { message } => return Err(internal_error(message)),
+        other => return Err(internal_error(other)),
     };
 
     let assistant_tool_calls: Vec<ToolCall> = tool_calls
@@ -169,7 +192,7 @@ pub async fn chat_handler(
             input: serde_json::Value::Null,
         })
         .collect();
-    data.session.messages.push(Message::Assistant(AssistantMsg {
+    data.session.append(Message::Assistant(AssistantMsg {
         text: text.clone(),
         tool_calls: assistant_tool_calls,
     }));
@@ -197,7 +220,7 @@ pub async fn list_sessions(
         .map(|d| SessionSummaryDto {
             id: d.session.id.to_string(),
             created_at: d.session.created_at,
-            message_count: d.session.messages.len(),
+            message_count: d.session.message_count(),
         })
         .collect();
     Json(summaries)
@@ -218,7 +241,7 @@ pub async fn get_session(
     Ok(Json(SessionDetailDto {
         id: data.session.id.to_string(),
         created_at: data.session.created_at,
-        messages: data.session.messages.clone(),
+        messages: data.session.messages().to_vec(),
     }))
 }
 
@@ -240,6 +263,14 @@ fn spec_to_dto(spec: &ToolSpec) -> ToolInfoDto {
     }
 }
 
+fn internal_error<E: std::fmt::Debug>(e: E) -> (StatusCode, String) {
+    tracing::error!(?e, "internal server error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".into(),
+    )
+}
+
 pub async fn compile_prompt(
     State(state): State<AppState>,
     Json(req): Json<CompilePromptRequestDto>,
@@ -248,7 +279,7 @@ pub async fn compile_prompt(
         .orchestrator
         .compile_prompt(&req.profile)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
     Ok(Json(CompilePromptResponseDto { prompt }))
 }
 
@@ -260,6 +291,6 @@ pub async fn list_sections(
         .orchestrator
         .list_sections(&q.profile)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
     Ok(Json(sections))
 }

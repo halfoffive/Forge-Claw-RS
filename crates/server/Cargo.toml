@@ -24,6 +24,10 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 rust-embed = { workspace = true }
+secrecy = { workspace = true }
+subtle = "2.6"
+tower_governor = "0.8"
 
 [dev-dependencies]
 tempfile = "3.27"
+tokio-tungstenite = "0.26"

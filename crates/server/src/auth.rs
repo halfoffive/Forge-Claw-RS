@@ -10,17 +10,43 @@ use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::{DateTime, Duration, Utc};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::api::AppState;
 
-/// 用户模型。
-#[derive(Clone, Debug, Serialize)]
+/// 用户模型（内部使用，token 用 `SecretString` 保护）。
+#[derive(Clone, Debug)]
 pub struct User {
     pub id: Uuid,
     pub name: String,
-    pub token: String,
+    pub token: SecretString,
+}
+
+/// 对外暴露的用户信息，不含 token。
+#[derive(Debug, Clone, Serialize)]
+pub struct UserPublic {
+    pub id: Uuid,
+    pub name: String,
+}
+
+impl From<&User> for UserPublic {
+    fn from(user: &User) -> Self {
+        Self {
+            id: user.id,
+            name: user.name.clone(),
+        }
+    }
+}
+
+/// 一次性 WebSocket ticket（60s 有效）。
+#[derive(Clone, Debug)]
+pub struct Ticket {
+    pub user_id: Uuid,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// 用户存储：按 token / name 双索引查找。放入 `Arc` 后置入 [`AppState`] 共享。
@@ -34,7 +60,7 @@ impl UserStore {
         let mut by_token = HashMap::new();
         let mut by_name = HashMap::new();
         for u in users {
-            by_token.insert(u.token.clone(), u.clone());
+            by_token.insert(u.token.expose_secret().to_string(), u.clone());
             by_name.insert(u.name.clone(), u);
         }
         Self { by_token, by_name }
@@ -47,7 +73,7 @@ impl UserStore {
             .map(|(name, token)| User {
                 id: Uuid::new_v4(),
                 name,
-                token,
+                token: SecretString::new(token.into()),
             })
             .collect();
         Self::new(users)
@@ -81,6 +107,37 @@ impl UserStore {
 
     pub fn find_by_name(&self, name: &str) -> Option<User> {
         self.by_name.get(name).cloned()
+    }
+
+    pub fn find_by_id(&self, id: Uuid) -> Option<User> {
+        self.by_name.values().find(|u| u.id == id).cloned()
+    }
+}
+
+impl AppState {
+    /// 签发一个 60s 有效的一次性 WS ticket。
+    pub async fn issue_ticket(&self, user_id: Uuid) -> Uuid {
+        let ticket = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::seconds(60);
+        let mut tickets = self.tickets.write().await;
+        tickets.insert(
+            ticket,
+            Ticket {
+                user_id,
+                expires_at,
+            },
+        );
+        ticket
+    }
+
+    /// 消费 ticket：返回对应用户。ticket 用后即焚，过期也返回 None。
+    pub async fn consume_ticket(&self, ticket: Uuid) -> Option<User> {
+        let mut tickets = self.tickets.write().await;
+        let t = tickets.remove(&ticket)?;
+        if t.expires_at < Utc::now() {
+            return None;
+        }
+        self.user_store.find_by_id(t.user_id)
     }
 }
 
@@ -148,11 +205,17 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub ok: bool,
-    pub user: User,
+    pub user: UserPublic,
+    pub ticket: Uuid,
 }
 
-/// `POST /api/auth/login`：校验 `{name, token}`，返回 `{ok:true, user}`。
+/// `POST /api/auth/login`：校验 `{name, token}`，返回 `{ok:true, user, ticket}`。
+/// ticket 用于 `/ws/chat?ticket=...`，60s 内一次性有效。
 /// 不套 auth 中间件。
+fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
 pub async fn login_handler(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
@@ -161,8 +224,63 @@ pub async fn login_handler(
         .user_store
         .find_by_name(&req.name)
         .ok_or_else(unauthorized_response)?;
-    if user.token != req.token {
+    if !constant_time_token_eq(user.token.expose_secret(), &req.token) {
         return Err(unauthorized_response());
     }
-    Ok(Json(LoginResponse { ok: true, user }))
+    let ticket = state.issue_ticket(user.id).await;
+    Ok(Json(LoginResponse {
+        ok: true,
+        user: UserPublic::from(&user),
+        ticket,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_tokens_match() {
+        assert!(constant_time_token_eq("alice-token", "alice-token"));
+    }
+
+    #[test]
+    fn different_tokens_do_not_match() {
+        assert!(!constant_time_token_eq("alice-token", "alice-tokex"));
+    }
+
+    #[test]
+    fn different_length_tokens_do_not_match() {
+        assert!(!constant_time_token_eq("short", "longer"));
+    }
+
+    #[test]
+    fn login_response_does_not_leak_token() {
+        let secret_token = "super-secret-token";
+        let user = User {
+            id: Uuid::new_v4(),
+            name: "alice".into(),
+            token: SecretString::new(secret_token.into()),
+        };
+        let resp = LoginResponse {
+            ok: true,
+            user: UserPublic::from(&user),
+            ticket: Uuid::new_v4(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains(secret_token));
+        assert!(json.contains("\"name\":\"alice\""));
+    }
+
+    #[test]
+    fn user_debug_does_not_leak_token() {
+        let secret_token = "debug-secret-token";
+        let user = User {
+            id: Uuid::new_v4(),
+            name: "alice".into(),
+            token: SecretString::new(secret_token.into()),
+        };
+        let out = format!("{:?}", user);
+        assert!(!out.contains(secret_token));
+    }
 }

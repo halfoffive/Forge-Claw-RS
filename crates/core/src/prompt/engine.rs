@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::error::{CoreError, Result};
 use crate::model::Section;
@@ -23,8 +25,8 @@ use crate::prompt::section::load_section_file;
 /// 提示词编译引擎。
 pub struct PromptEngine {
     profiles_root: PathBuf,
-    cache: HashMap<u64, String>,
-    compile_count: usize,
+    cache: Arc<RwLock<HashMap<u64, String>>>,
+    compile_count: AtomicUsize,
 }
 
 impl PromptEngine {
@@ -32,14 +34,14 @@ impl PromptEngine {
     pub fn new(profiles_root: PathBuf) -> Self {
         Self {
             profiles_root,
-            cache: HashMap::new(),
-            compile_count: 0,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            compile_count: AtomicUsize::new(0),
         }
     }
 
     /// 实际编译次数（不含缓存命中）。用于测试与可观测性。
     pub fn compile_count(&self) -> usize {
-        self.compile_count
+        self.compile_count.load(Ordering::Relaxed)
     }
 
     fn profile_path(&self, profile_name: &str) -> PathBuf {
@@ -82,17 +84,22 @@ impl PromptEngine {
     ///
     /// `vars` 中常见的 key：`tools` / `model` / `cwd`，
     /// 会替换 section body 中的 `{{tools}}` / `{{model}}` / `{{cwd}}`。
-    pub fn compile(&mut self, profile_name: &str, vars: &HashMap<&str, String>) -> Result<String> {
+    pub fn compile(&self, profile_name: &str, vars: &HashMap<&str, String>) -> Result<String> {
+        // 文件 IO 在锁外完成，避免阻塞其他并发 compile。
         let sections = self.load_all_sections(profile_name)?;
         let enabled = enabled_sorted(sections);
 
         let key = compute_cache_key(profile_name, &enabled, vars);
-        if let Some(cached) = self.cache.get(&key) {
-            return Ok(cached.clone());
+
+        // 短读临界区：仅查询缓存。
+        {
+            let cache = self.cache.read().expect("cache lock poisoned");
+            if let Some(cached) = cache.get(&key) {
+                return Ok(cached.clone());
+            }
         }
 
-        self.compile_count += 1;
-
+        // 缓存未命中：在锁外拼接输出。
         let mut output = String::new();
         for section in &enabled {
             if !output.is_empty() {
@@ -108,7 +115,16 @@ impl PromptEngine {
             output = output.replace(&format!("{{{{{k}}}}}"), v);
         }
 
-        self.cache.insert(key, output.clone());
+        // 短写临界区：再次检查（双重检查锁定）后插入。
+        {
+            let mut cache = self.cache.write().expect("cache lock poisoned");
+            if let Some(cached) = cache.get(&key) {
+                return Ok(cached.clone());
+            }
+            cache.insert(key, output.clone());
+            self.compile_count.fetch_add(1, Ordering::Relaxed);
+        }
+
         Ok(output)
     }
 }
@@ -164,7 +180,7 @@ mod tests {
 
     #[test]
     fn compiles_default_profile_with_all_sections() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let out = engine.compile("default", &vars()).expect("compile failed");
         for title in ["身份与产品信息", "安全与拒绝处理", "工具使用", "语气与格式"]
         {
@@ -177,7 +193,7 @@ mod tests {
 
     #[test]
     fn variables_are_replaced() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let out = engine.compile("default", &vars()).expect("compile failed");
         assert!(
             !out.contains("{{tools}}"),
@@ -195,7 +211,7 @@ mod tests {
 
     #[test]
     fn cache_hit_does_not_rebuild() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let v = vars();
         let first = engine.compile("default", &v).expect("compile failed");
         let count_after_first = engine.compile_count();
@@ -212,7 +228,7 @@ mod tests {
 
     #[test]
     fn different_vars_invalidate_cache() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let v1 = vars();
         let mut v2 = vars();
         v2.insert("cwd", "/other/workspace".to_string());
@@ -249,5 +265,35 @@ mod tests {
         let engine = PromptEngine::new(profiles_root());
         let err = engine.list_sections("does-not-exist").unwrap_err();
         assert!(matches!(err, CoreError::ProfileNotFound(_)));
+    }
+
+    #[test]
+    fn concurrent_compile_is_race_free() {
+        let engine = Arc::new(PromptEngine::new(profiles_root()));
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let engine = Arc::clone(&engine);
+            let vars = vars();
+            handles.push(std::thread::spawn(move || {
+                let first = engine.compile("default", &vars).expect("compile failed");
+                let second = engine.compile("default", &vars).expect("compile failed");
+                assert_eq!(first, second);
+                first
+            }));
+        }
+
+        let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for r in &results[1..] {
+            assert_eq!(
+                results[0], *r,
+                "all concurrent compiles should produce identical output"
+            );
+        }
+        assert_eq!(
+            engine.compile_count(),
+            1,
+            "only one compile should be counted across all threads"
+        );
     }
 }
