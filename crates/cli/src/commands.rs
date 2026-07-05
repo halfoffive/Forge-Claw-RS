@@ -1,0 +1,599 @@
+//! CLI 子命令实现：chat REPL（流式着色）/ run / prompt / tool / web / config。
+//!
+//! 设计要点：
+//! - `chat` 与 `web` 用 `forgeclaw_server::build_orchestrator`（auto_confirm）；
+//!   `run` 默认 confirm 模式，在 cli 内自建 orchestrator（带 stdin 确认器）。
+//! - 流式着色直接用 ANSI 转义，不引入 colored。
+//! - `/model` 切换需重建 orchestrator（`Orchestrator.model` 无 setter）。
+
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::bail;
+use forgeclaw_core::prompt::PromptEngine;
+use forgeclaw_llm::{FunctionSpec, History, LlmClient, OpenAiClient, ToolSpec};
+use forgeclaw_server::{
+    build_orchestrator as build_server_orchestrator, run as server_run, AppState, Orchestrator,
+    OrchestratorConfig, OrchestratorEvent, UserStore,
+};
+use forgeclaw_tools::{
+    Confirmer, FileReadTool, FileWriteTool, GrepTool, Sandbox, SearchTool, ShellTool, Tool,
+};
+
+use crate::config::Config;
+
+// ============ ANSI 颜色（直接转义，不引入 colored） ============
+
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+// ============ Orchestrator 构建 ============
+
+/// 构建 orchestrator。`auto_apply=true` 用 server 工厂（auto_confirm）；
+/// `false` 在 cli 内自建带 stdin 确认器的沙箱。
+fn build_orchestrator(cfg: &Config, auto_apply: bool) -> anyhow::Result<Arc<Orchestrator>> {
+    if cfg.api_key.is_empty() {
+        bail!(
+            "api_key 未配置：请设置环境变量 DEEPSEEK_API_KEY/FORGECLAW_API_KEY，\
+             或运行 `forgeclaw-cli config init` 后填写 ~/.forgeclaw/config.toml"
+        );
+    }
+    if auto_apply {
+        let orch = build_server_orchestrator(OrchestratorConfig {
+            base_url: cfg.base_url.clone(),
+            api_key: cfg.api_key.clone(),
+            prompts_root: cfg.prompts_root.clone(),
+            working_dir: cfg.working_dir.clone(),
+            model: cfg.model.clone(),
+            profile: cfg.profile.clone(),
+        })?;
+        return Ok(orch);
+    }
+    build_orchestrator_confirm(cfg)
+}
+
+/// confirm 模式：5 工具 + stdin 确认器（复制 server 的工具注册与 spec 描述，
+/// 因 `Sandbox` 不暴露 confirmer 替换接口）。
+fn build_orchestrator_confirm(cfg: &Config) -> anyhow::Result<Arc<Orchestrator>> {
+    let llm: Arc<dyn LlmClient> = Arc::new(OpenAiClient::new(
+        cfg.base_url.clone(),
+        cfg.api_key.clone(),
+    )?);
+    let working_dir = cfg.working_dir.clone();
+    let shell = ShellTool::new(working_dir.clone());
+    let read = FileReadTool::new(working_dir.clone());
+    let write = FileWriteTool::new(working_dir.clone());
+    let search = SearchTool::new(working_dir.clone());
+    let grep = GrepTool::new(working_dir.clone());
+    let specs = vec![
+        spec_for(&shell, "Execute shell commands in the working directory"),
+        spec_for(&read, "Read a file from the working directory"),
+        spec_for(&write, "Write content to a file in the working directory"),
+        spec_for(
+            &search,
+            "Search files by glob pattern in the working directory",
+        ),
+        spec_for(
+            &grep,
+            "Grep file contents by regex in the working directory",
+        ),
+    ];
+    let confirmer: Confirmer = Box::new(|name: &str, input: &serde_json::Value| {
+        eprintln!();
+        eprintln!("{YELLOW}[确认] 工具调用: {name}{RESET}");
+        eprintln!(
+            "  输入: {}",
+            serde_json::to_string(input).unwrap_or_default()
+        );
+        eprint!("允许执行? [y/N] ");
+        let _ = io::stderr().flush();
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(_) => line.trim().eq_ignore_ascii_case("y"),
+            Err(_) => false,
+        }
+    });
+    let mut sb = Sandbox::new(working_dir.clone(), confirmer);
+    sb.register(Box::new(shell));
+    sb.register(Box::new(read));
+    sb.register(Box::new(write));
+    sb.register(Box::new(search));
+    sb.register(Box::new(grep));
+    Ok(Arc::new(Orchestrator::new(
+        llm,
+        Arc::new(sb),
+        specs,
+        cfg.prompts_root.clone(),
+        cfg.profile.clone(),
+        cfg.model.clone(),
+        working_dir,
+    )))
+}
+
+fn spec_for(tool: &dyn Tool, description: &str) -> ToolSpec {
+    ToolSpec {
+        typ: "function".to_string(),
+        function: FunctionSpec {
+            name: tool.name().to_string(),
+            description: description.to_string(),
+            parameters: tool.schema(),
+        },
+    }
+}
+
+/// 与 orchestrator.prompt_vars 一致的变量注入（tools/model/cwd）。
+fn prompt_vars(cfg: &Config) -> HashMap<&'static str, String> {
+    let tools = Sandbox::default_for(cfg.working_dir.clone())
+        .list()
+        .join(", ");
+    let mut v = HashMap::new();
+    v.insert("tools", tools);
+    v.insert("model", cfg.model.clone());
+    v.insert("cwd", cfg.working_dir.display().to_string());
+    v
+}
+
+// ============ chat ============
+
+pub async fn run_chat(cfg: Config, message: Option<String>) -> anyhow::Result<()> {
+    let mut orch = build_orchestrator(&cfg, true)?;
+    let mut history = History::new();
+
+    if let Some(msg) = message {
+        let event = orch.run_once(&mut history, msg).await?;
+        print_final_event(&event);
+        return Ok(());
+    }
+
+    let mut rl = rustyline::DefaultEditor::new()?;
+    println!("ForgeClaw REPL — /help 查看命令，/exit 退出");
+    let mut current_cfg = cfg;
+    loop {
+        let line = match rl.readline("fc> ") {
+            Ok(l) => l,
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(e) => return Err(e.into()),
+        };
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let _ = rl.add_history_entry(&trimmed);
+
+        if trimmed == "/exit" || trimmed == "/quit" {
+            break;
+        }
+        if trimmed == "/help" {
+            print_repl_help();
+            continue;
+        }
+        if trimmed == "/clear" {
+            history = History::new();
+            println!("(会话已清空)");
+            continue;
+        }
+        if trimmed == "/prompt" {
+            match orch.compile_prompt(&current_cfg.profile).await {
+                Ok(p) => println!("{p}"),
+                Err(e) => eprintln!("{RED}编译失败: {e}{RESET}"),
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/tool ") {
+            let cmd = rest.trim();
+            if cmd == "ls" || cmd == "list" {
+                for t in Sandbox::default_for(current_cfg.working_dir.clone()).list() {
+                    println!("{t}");
+                }
+            } else {
+                println!("未知 /tool 子命令: {cmd}（可用: ls）");
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/model ") {
+            let new_model = rest.trim().to_string();
+            if new_model.is_empty() {
+                println!("用法: /model <name>");
+                continue;
+            }
+            let mut next_cfg = current_cfg.clone();
+            next_cfg.model = new_model.clone();
+            match build_orchestrator(&next_cfg, true) {
+                Ok(new_orch) => {
+                    orch = new_orch;
+                    current_cfg = next_cfg;
+                    println!("(模型已切换为 {new_model})");
+                }
+                Err(e) => println!("切换失败: {e}"),
+            }
+            continue;
+        }
+        if trimmed.starts_with('/') {
+            println!("未知命令: {trimmed}（/help 查看可用命令）");
+            continue;
+        }
+
+        if let Err(e) = run_streaming_turn(orch.clone(), &mut history, trimmed).await {
+            eprintln!("{RED}出错: {e}{RESET}");
+        }
+    }
+    Ok(())
+}
+
+fn print_repl_help() {
+    println!("REPL 命令:");
+    println!("  /help              显示本帮助");
+    println!("  /exit | /quit      退出");
+    println!("  /clear             清空当前会话");
+    println!("  /prompt            显示当前编译的 system prompt");
+    println!("  /tool ls           列出可用工具");
+    println!("  /model <name>      切换 LLM 模型");
+    println!("直接输入文本即与助手对话（流式输出）。");
+}
+
+/// 驱动一轮流式对话：用 `tokio::join!` 在同一任务上并发跑 `run_streaming`（生产事件）
+/// 与 receiver 排空（着色打印）。history 借用传入，调用方始终持有，出错也不丢会话。
+async fn run_streaming_turn(
+    orch: Arc<Orchestrator>,
+    history: &mut History,
+    msg: String,
+) -> anyhow::Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OrchestratorEvent>(128);
+    let producer = async move { orch.run_streaming(history, msg, tx).await };
+    let consumer = async {
+        while let Some(ev) = rx.recv().await {
+            print_stream_event(&ev);
+            if matches!(
+                ev,
+                OrchestratorEvent::Complete { .. } | OrchestratorEvent::Error { .. }
+            ) {
+                break;
+            }
+        }
+    };
+    let (res, ()) = tokio::join!(producer, consumer);
+    res
+}
+
+fn print_stream_event(ev: &OrchestratorEvent) {
+    match ev {
+        OrchestratorEvent::Delta { text } => {
+            print!("{CYAN}{text}{RESET}");
+            let _ = io::stdout().flush();
+        }
+        OrchestratorEvent::ToolCallStart { name, input } => {
+            println!("\n{YELLOW}[tool] {name}: {input}{RESET}");
+            let _ = io::stdout().flush();
+        }
+        OrchestratorEvent::ToolResult { name, result } => {
+            if let Some(err) = &result.error {
+                println!("{RED}[result] {name}: error: {err}{RESET}");
+            } else {
+                println!(
+                    "{GREEN}[result] {name}: {}{RESET}",
+                    truncate(&result.output, 200)
+                );
+            }
+            let _ = io::stdout().flush();
+        }
+        OrchestratorEvent::Complete { .. } => {
+            println!();
+            let _ = io::stdout().flush();
+        }
+        OrchestratorEvent::Error { message } => {
+            eprintln!("{RED}[error] {message}{RESET}");
+        }
+    }
+}
+
+fn print_final_event(ev: &OrchestratorEvent) {
+    match ev {
+        OrchestratorEvent::Complete { text, .. } => println!("{text}"),
+        OrchestratorEvent::Error { message } => eprintln!("{RED}[error] {message}{RESET}"),
+        other => eprintln!("{RED}[unexpected event: {other:?}]{RESET}"),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("...");
+    out
+}
+
+// ============ run ============
+
+pub async fn run_run(cfg: Config, task: String, auto_apply: bool) -> anyhow::Result<()> {
+    let orch = build_orchestrator(&cfg, auto_apply)?;
+    let mut history = History::new();
+    let event = orch.run_once(&mut history, task).await?;
+    print_final_event(&event);
+    Ok(())
+}
+
+// ============ prompt ============
+
+pub async fn run_prompt_compile(cfg: Config, profile: String) -> anyhow::Result<()> {
+    let mut engine = PromptEngine::new(cfg.prompts_root.clone());
+    let vars = prompt_vars(&cfg);
+    let prompt = engine.compile(&profile, &vars)?;
+    print!("{prompt}");
+    if !prompt.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+pub async fn run_prompt_list(cfg: Config) -> anyhow::Result<()> {
+    let engine = PromptEngine::new(cfg.prompts_root.clone());
+    let sections = engine.list_sections(&cfg.profile)?;
+    if sections.is_empty() {
+        println!("(无启用的 section)");
+        return Ok(());
+    }
+    for s in sections {
+        println!("{}. {} ({})", s.order, s.title, s.id);
+    }
+    Ok(())
+}
+
+// ============ tool ============
+
+pub async fn run_tool_list(cfg: Config) -> anyhow::Result<()> {
+    let sb = Sandbox::default_for(cfg.working_dir.clone());
+    for t in sb.list() {
+        println!("{t}");
+    }
+    Ok(())
+}
+
+pub async fn run_tool_exec(cfg: Config, tool: String, args: Vec<String>) -> anyhow::Result<()> {
+    let sb = Sandbox::default_for(cfg.working_dir.clone());
+    let input = build_tool_input(&tool, &args);
+    let result = sb.execute(&tool, input).await?;
+    let mut failed = false;
+    if let Some(err) = &result.error {
+        eprintln!("{RED}error: {err}{RESET}");
+        failed = true;
+    }
+    if !result.output.is_empty() {
+        print!("{}", result.output);
+        if !result.output.ends_with('\n') {
+            println!();
+        }
+        let _ = io::stdout().flush();
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// 把命令行 args 构造为工具 input。
+/// 单个 JSON 对象参数直接用作 input；否则按工具名映射字段。
+fn build_tool_input(tool: &str, args: &[String]) -> serde_json::Value {
+    use serde_json::json;
+    if args.len() == 1 {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&args[0]) {
+            if v.is_object() {
+                return v;
+            }
+        }
+    }
+    match tool {
+        "shell" => json!({ "command": args.join(" ") }),
+        "read" => json!({ "path": args.first().cloned().unwrap_or_default() }),
+        "write" => json!({
+            "path": args.first().cloned().unwrap_or_default(),
+            "content": args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ")
+        }),
+        "search" => json!({ "pattern": args.first().cloned().unwrap_or_default() }),
+        "grep" => {
+            let mut v = json!({ "pattern": args.first().cloned().unwrap_or_default() });
+            if let Some(p) = args.get(1) {
+                v["path"] = serde_json::Value::String(p.clone());
+            }
+            v
+        }
+        _ => json!({ "args": args }),
+    }
+}
+
+// ============ web ============
+
+pub async fn run_web(cfg: Config, port: u16) -> anyhow::Result<()> {
+    let orch = build_orchestrator(&cfg, true)?;
+    let users = resolve_users(&cfg);
+    let user_store = UserStore::from_config(users.clone());
+    let state = AppState::new(orch, user_store);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("ForgeClaw Web 服务已启动: http://127.0.0.1:{port}");
+    println!(
+        "可用用户: {}",
+        users
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "登录 POST /api/auth/login {{name, token}}；受保护路由需 Authorization: Bearer <token>"
+    );
+    server_run(addr, state).await
+}
+
+/// 解析 web 用户：env `FORGECLAW_USERS` > 配置文件 users > 默认本地用户。
+fn resolve_users(cfg: &Config) -> Vec<(String, String)> {
+    let env_raw = std::env::var("FORGECLAW_USERS").unwrap_or_default();
+    if !env_raw.trim().is_empty() {
+        env_raw
+            .split(',')
+            .filter_map(|e| {
+                let (n, t) = e.trim().split_once(':')?;
+                let n = n.trim().to_string();
+                let t = t.trim().to_string();
+                if n.is_empty() || t.is_empty() {
+                    return None;
+                }
+                Some((n, t))
+            })
+            .collect()
+    } else if !cfg.users.is_empty() {
+        cfg.users.clone()
+    } else {
+        vec![("local".to_string(), "local-token".to_string())]
+    }
+}
+
+// ============ config ============
+
+pub fn run_config_show(cfg: &Config) -> anyhow::Result<()> {
+    println!("api_key     : {}", cfg.masked_api_key());
+    println!("base_url    : {}", cfg.base_url);
+    println!("model       : {}", cfg.model);
+    println!("prompts_root: {}", cfg.prompts_root.display());
+    println!("working_dir : {}", cfg.working_dir.display());
+    println!("profile     : {}", cfg.profile);
+    let users = cfg
+        .users
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "users       : {}",
+        if users.is_empty() { "(无)" } else { &users }
+    );
+    Ok(())
+}
+
+pub fn run_config_init() -> anyhow::Result<()> {
+    let cfg = Config::default_for_init();
+    cfg.save()?;
+    match crate::config::config_path() {
+        Some(p) => println!("已写入默认配置: {}", p.display()),
+        None => println!("已写入默认配置"),
+    }
+    println!("请编辑该文件填入 api_key，或设置环境变量 DEEPSEEK_API_KEY。");
+    Ok(())
+}
+
+pub fn run_config_set(key: &str, value: &str) -> anyhow::Result<()> {
+    let mut cfg = crate::config::load_file_or_defaults();
+    match key {
+        "api_key" => cfg.api_key = value.to_string(),
+        "base_url" => cfg.base_url = value.to_string(),
+        "model" => cfg.model = value.to_string(),
+        "prompts_root" => cfg.prompts_root = PathBuf::from(value),
+        "working_dir" => cfg.working_dir = PathBuf::from(value),
+        "profile" => cfg.profile = value.to_string(),
+        _ => bail!(
+            "未知配置项: {key}（支持: api_key, base_url, model, prompts_root, working_dir, profile）"
+        ),
+    }
+    cfg.save()?;
+    println!("已设置 {key} = {value}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_tool_input_json_object_passthrough() {
+        let v = build_tool_input("shell", &["{\"command\":\"echo hi\"}".to_string()]);
+        assert_eq!(v["command"], "echo hi");
+    }
+
+    #[test]
+    fn build_tool_input_shell_joins_args() {
+        let v = build_tool_input("shell", &["echo".to_string(), "hello world".to_string()]);
+        assert_eq!(v["command"], "echo hello world");
+    }
+
+    #[test]
+    fn build_tool_input_read_path() {
+        let v = build_tool_input("read", &["a.txt".to_string()]);
+        assert_eq!(v["path"], "a.txt");
+    }
+
+    #[test]
+    fn build_tool_input_write_path_content() {
+        let v = build_tool_input(
+            "write",
+            &[
+                "out.txt".to_string(),
+                "hello".to_string(),
+                "there".to_string(),
+            ],
+        );
+        assert_eq!(v["path"], "out.txt");
+        assert_eq!(v["content"], "hello there");
+    }
+
+    #[test]
+    fn build_tool_input_grep_optional_path() {
+        let v = build_tool_input("grep", &["foo".to_string(), "src".to_string()]);
+        assert_eq!(v["pattern"], "foo");
+        assert_eq!(v["path"], "src");
+    }
+
+    #[test]
+    fn build_tool_input_unknown_falls_back_to_args() {
+        let v = build_tool_input("nope", &["x".to_string(), "y".to_string()]);
+        assert_eq!(v["args"][0], "x");
+        assert_eq!(v["args"][1], "y");
+    }
+
+    #[test]
+    fn truncate_short_unchanged() {
+        assert_eq!(truncate("abc", 10), "abc");
+    }
+
+    #[test]
+    fn truncate_long_appends_ellipsis() {
+        let s = "a".repeat(50);
+        let t = truncate(&s, 5);
+        assert_eq!(t.chars().count(), 8);
+        assert!(t.ends_with("..."));
+    }
+
+    #[test]
+    fn resolve_users_defaults_to_local() {
+        // 无 env 无配置 → 默认本地用户
+        std::env::remove_var("FORGECLAW_USERS");
+        let cfg = Config::default();
+        let u = resolve_users(&cfg);
+        assert_eq!(u, vec![("local".to_string(), "local-token".to_string())]);
+    }
+
+    #[test]
+    fn resolve_users_uses_config_users_when_no_env() {
+        std::env::remove_var("FORGECLAW_USERS");
+        let cfg = Config {
+            users: vec![("alice".into(), "t1".into())],
+            ..Config::default()
+        };
+        let u = resolve_users(&cfg);
+        assert_eq!(u[0].0, "alice");
+    }
+
+    #[tokio::test]
+    async fn tool_list_returns_five_tools() {
+        let dir = std::env::temp_dir();
+        let sb = Sandbox::default_for(dir);
+        let names = sb.list();
+        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"shell".to_string()));
+    }
+}

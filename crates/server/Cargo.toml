@@ -1,0 +1,29 @@
+[package]
+name = "forgeclaw-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+forgeclaw-core = { workspace = true }
+forgeclaw-llm = { workspace = true }
+forgeclaw-tools = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rust-embed = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27"

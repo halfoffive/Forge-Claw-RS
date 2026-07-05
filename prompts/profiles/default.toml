@@ -1,0 +1,9 @@
+[profile]
+name = "default"
+model_hint = "deepseek-chat"
+
+[sections]
+identity = "sections/identity.md"
+safety = "sections/safety.md"
+tools = "sections/tools.md"
+style = "sections/style.md"
