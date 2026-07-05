@@ -235,6 +235,16 @@ pub async fn login_handler(
     }))
 }
 
+/// `GET /api/auth/ticket`：为当前已鉴权用户签发一个一次性 WS ticket。
+/// 该端点受 auth 中间件保护。
+pub async fn ticket_handler(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> Result<Json<serde_json::Value>, Response> {
+    let ticket = state.issue_ticket(user.id).await;
+    Ok(Json(serde_json::json!({ "ticket": ticket })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,6 @@
 export interface User {
   id: string
   name: string
-  token: string
 }
 
 export interface LoginRequest {
@@ -12,6 +11,7 @@ export interface LoginRequest {
 export interface LoginResponse {
   ok: boolean
   user: User
+  ticket: string
 }
 
 export interface ChatRequest {

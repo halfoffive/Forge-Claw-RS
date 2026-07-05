@@ -91,6 +91,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     }
     return (await res.json()) as T
   } catch (err) {
+    controller.abort()
     if (err instanceof ApiError) throw err
     if (err instanceof Error && err.name === 'AbortError') {
       throw new ApiError('Request timeout', undefined, 'TIMEOUT')
@@ -104,4 +105,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   get: <T>(path: string) => request<T>(path, { method: 'GET' }),
   post: <T>(path: string, body: unknown) => request<T>(path, { method: 'POST', body: JSON.stringify(body) }),
+}
+
+export async function getWsTicket(): Promise<string> {
+  const res = await api.get<{ ticket: string }>('/api/auth/ticket')
+  return res.ticket
 }

@@ -49,7 +49,7 @@ function logout() {
           :collapsed-icon-size="22"
           @update:value="handleMenuSelect"
         />
-        <NButton v-if="auth.isLoggedIn" class="logout-btn" ghost @click="logout">
+        <NButton v-if="auth.isLoggedIn" class="logout-btn" ghost aria-label="退出登录" @click="logout">
           退出
         </NButton>
       </NSpace>

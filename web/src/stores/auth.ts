@@ -15,13 +15,13 @@ export const useAuthStore = defineStore('auth', () => {
     loading.value = true
     error.value = null
     try {
-      const res = await api.post<{ ok: boolean; user: User }>('/api/auth/login', credentials)
+      const res = await api.post<{ ok: boolean; user: User; ticket: string }>('/api/auth/login', credentials)
       if (!res.ok || !res.user) {
         throw new Error('Login failed')
       }
       user.value = res.user
-      token.value = res.user.token
-      setToken(res.user.token)
+      token.value = credentials.token
+      setToken(credentials.token)
       return true
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err)

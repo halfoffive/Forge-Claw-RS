@@ -146,7 +146,7 @@
   - 受影响：`crates/server/src/ws.rs`、`crates/server/src/orchestrator.rs`、`crates/server/tests/auth_test.rs`、`crates/server/tests/orchestrator_test.rs`
   - 可并行：是
 
-- [ ] Task 20: 错误处理加固（C-010/C-011/C-012/C-013/D-009/D-012）
+- [x] Task 20: 错误处理加固（C-010/C-011/C-012/C-013/D-009/D-012）
   - `auth.rs` token 比较改用 `subtle::ConstantTimeEq`；`/api/auth/login` 加 `tower_governor` 限流
   - `api.rs`/`ws.rs` 的 500 响应体统一返回 `"internal server error"`，详细 `tracing::error!` 落日志
   - `commands.rs` 的 `config set api_key` 用 `mask_key` 输出
@@ -194,20 +194,20 @@
 
 ## 阶段 6：循环审查
 
-- [ ] Task 25: 第一轮多视角再审查
+- [x] Task 25: 第一轮多视角再审查
   - 委派 3 个独立子代理（安全、并发/编排器、前端/类型）审查修复后代码
   - 每个子代理返回 P0/P1/P2 发现清单
   - 修复目标：获得新发现清单
 
-- [ ] Task 26: 修复第一轮新发现的 P0/P1
+- [x] Task 26: 修复第一轮新发现的 P0/P1
   - 针对新发现创建修复任务并实施
   - 修复目标：P0/P1 计数下降
 
-- [ ] Task 27: 第二轮多视角再审查
+- [x] Task 27: 第二轮多视角再审查
   - 再次委派 3 个独立子代理审查
   - 修复目标：P0 = 0，P1 = 0
 
-- [ ] Task 28: 运行完整 CI
+- [x] Task 28: 运行完整 CI
   - `cargo fmt --check`
   - `cargo clippy -- -D warnings`
   - `cargo test`

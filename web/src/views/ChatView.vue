@@ -12,7 +12,7 @@ import {
   NTag,
 } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
-import { getServerUrl, getToken } from '../api/client'
+import { getServerUrl, getWsTicket } from '../api/client'
 import type { Message, OrchestratorEvent } from '../api/types'
 import { useSessionStore } from '../stores/session'
 
@@ -43,18 +43,18 @@ function messageRole(msg: Message): string {
   return ''
 }
 
-function buildWsUrl(): string {
+async function buildWsUrl(): Promise<string> {
   const base = getServerUrl() || window.location.origin
   const url = new URL('/ws/chat', base)
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  const token = getToken()
-  if (token) url.searchParams.set('token', token)
+  const ticket = await getWsTicket()
+  url.searchParams.set('ticket', ticket)
   return url.toString()
 }
 
-function connect() {
+async function connect() {
   if (ws) return
-  ws = new WebSocket(buildWsUrl())
+  ws = new WebSocket(await buildWsUrl())
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data) as OrchestratorEvent

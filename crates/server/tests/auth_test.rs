@@ -227,6 +227,37 @@ async fn login_endpoint_does_not_require_auth() {
 }
 
 #[tokio::test]
+async fn ticket_endpoint_requires_auth_and_returns_ticket() {
+    let (state, _dir) = build_state();
+    // 无 token 应 401
+    let response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/ticket")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // 有 token 应返回 ticket
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/ticket")
+                .header("authorization", format!("Bearer {ALICE_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let v = body_to_json(response.into_body()).await;
+    assert!(v["ticket"].is_string());
+}
+
+#[tokio::test]
 async fn login_rate_limit_blocks_after_5_attempts() {
     // 同一 IP + name 在 60s 窗口内最多 5 次尝试，第 6 次应返回 429。
     // 必须复用同一个 app（Router）， GovernorLayer 内部状态才共享。

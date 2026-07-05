@@ -185,6 +185,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/tools", get(api::list_tools))
         .route("/api/prompts/compile", post(api::compile_prompt))
         .route("/api/prompts/sections", get(api::list_sections))
+        .route("/api/auth/ticket", get(auth::ticket_handler))
         .layer(from_fn_with_state(state.clone(), auth::auth_middleware));
 
     let login_governor = GovernorConfigBuilder::default()

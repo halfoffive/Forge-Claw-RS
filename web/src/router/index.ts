@@ -38,8 +38,13 @@ const router = createRouter({
   routes,
 })
 
+function hasValidToken(): boolean {
+  const token = getToken()
+  return typeof token === 'string' && token.trim().length > 0
+}
+
 router.beforeEach((to) => {
-  if (to.meta.requiresAuth && !getToken()) {
+  if (to.meta.requiresAuth && !hasValidToken()) {
     return { path: '/login', query: { redirect: to.fullPath } }
   }
 })
