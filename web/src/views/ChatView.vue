@@ -64,26 +64,29 @@ async function send(): Promise<void> {
   session.pushMessage({ Assistant: { text: '', tool_calls: [] } })
   await scrollToBottom()
 
-  try {
-    const ticket = await getWsTicket(auth.token)
-    const url = buildWsUrl(ticket)
-    ws = new WebSocket(url)
-  } catch (e) {
-    status.value = 'error'
-    errorMsg.value = e instanceof ApiError ? e.message : '获取 WS ticket 失败'
-    sending.value = false
-    return
-  }
-
   // F-12: 新会话由前端预生成 session_id，后端据此创建并复用同一会话，
   // 避免后端 WS 流不回传 session_id 导致每条消息开新会话。
   if (!session.currentId) {
     session.setCurrentId(crypto.randomUUID())
   }
+  const currentId = session.currentId
 
   const payload: WsChatRequest = {
     message: text,
-    ...(session.currentId ? { session_id: session.currentId } : {}),
+    ...(currentId ? { session_id: currentId } : {}),
+  }
+
+  try {
+    const ticket = await getWsTicket(auth.token)
+    const url = buildWsUrl(ticket)
+    ws = new WebSocket(url)
+  } catch (e) {
+    // 清理已追加的用户消息与占位 assistant 消息，避免状态污染。
+    session.popMessage()
+    status.value = 'error'
+    errorMsg.value = e instanceof ApiError ? e.message : '获取 WS ticket 失败'
+    sending.value = false
+    return
   }
 
   ws.onopen = () => {

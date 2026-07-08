@@ -38,6 +38,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 /// 心跳间隔（SRV-003）：每 30s 发 Ping。
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// 单轮 orchestrator 任务超时（P1-SRV-002）：防止 spawn 任务持 history 写锁无限运行。
+const TASK_TIMEOUT: Duration = Duration::from_secs(300);
 /// WS 单帧/单消息大小上限（SRV-014）。
 const MAX_WS_FRAME_SIZE: usize = 256 * 1024;
 
@@ -224,12 +226,10 @@ async fn handle_text_frame(
     drop(rx);
 
     // 回写会话。R2-SRV-004：append 新消息而非整体 insert，避免并发覆盖。
-    // SRV-013：join.await 的 Err 分支记日志。
-    match join.await {
-        Ok(res) => {
-            if let Err(e) = res {
-                tracing::error!(error = %e, "run_streaming failed");
-            }
+    // P1-SRV-002：对 spawn 任务加超时，防止 WS 断开后任务仍持 history 写锁阻塞同 session 请求。
+    let res = tokio::time::timeout(TASK_TIMEOUT, join).await;
+    match res {
+        Ok(Ok(Ok(()))) => {
             if got_complete {
                 let assistant_tool_calls: Vec<ToolCall> = final_tool_calls
                     .iter()
@@ -268,8 +268,14 @@ async fn handle_text_frame(
                 }
             }
         }
-        Err(e) => {
-            tracing::error!(error = %e, "orchestrator task join failed");
+        Ok(Ok(Err(e))) => {
+            tracing::error!(error = %e, "run_streaming failed");
+        }
+        Ok(Err(_)) => {
+            tracing::error!("orchestrator task panicked");
+        }
+        Err(_) => {
+            tracing::error!("orchestrator task timed out after 300s");
         }
     }
 

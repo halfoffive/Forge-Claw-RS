@@ -142,13 +142,24 @@ impl Tool for FileReadTool {
         if !is_within(&path, &self.working_dir) {
             return Ok(blocked("path outside working directory"));
         }
+        const MAX_READ_BYTES: usize = 1024 * 1024;
+
         let start = std::time::Instant::now();
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => Ok(ToolResult {
-                output: content,
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            }),
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                let truncated = bytes.len() > MAX_READ_BYTES;
+                let text =
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_READ_BYTES)]).into_owned();
+                Ok(ToolResult {
+                    output: text,
+                    error: if truncated {
+                        Some(format!("output truncated at {} bytes", MAX_READ_BYTES))
+                    } else {
+                        None
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 output: String::new(),
                 error: Some(format!("read failed: {}", e)),

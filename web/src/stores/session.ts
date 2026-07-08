@@ -59,6 +59,11 @@ export const useSessionStore = defineStore('session', () => {
     currentMessages.value.push(msg)
   }
 
+  /** 撤销最后一次 push（用于 WS 建立失败时清理用户消息和占位 assistant）。 */
+  function popMessage(): void {
+    currentMessages.value.pop()
+  }
+
   function reset(): void {
     sessions.value = []
     currentId.value = null
@@ -77,6 +82,7 @@ export const useSessionStore = defineStore('session', () => {
     newSession,
     setCurrentId,
     pushMessage,
+    popMessage,
     reset,
   }
 })
