@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 
 const settings = useSettingsStore()
 const auth = useAuthStore()
+const router = useRouter()
 
 const server = ref(settings.server)
 const saved = ref(false)
@@ -18,6 +20,7 @@ function save(): void {
 
 function logout(): void {
   auth.logout()
+  router.replace('/login')
 }
 </script>
 

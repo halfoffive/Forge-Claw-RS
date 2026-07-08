@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { useAuthStore } from '@/stores/auth'
@@ -7,6 +7,14 @@ import { useAuthStore } from '@/stores/auth'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+
+// F-19: API 401 时 client.ts 派发此事件，这里统一清理登录态并跳转登录页。
+function onUnauthorized(): void {
+  auth.logout()
+  router.replace('/login')
+}
+onMounted(() => window.addEventListener('forgeclaw:unauthorized', onUnauthorized))
+onUnmounted(() => window.removeEventListener('forgeclaw:unauthorized', onUnauthorized))
 
 // 公开页（登录/404）不显示侧边栏布局。
 const showLayout = computed(() => !route.meta.public)

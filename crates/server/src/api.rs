@@ -53,15 +53,16 @@ pub struct SessionData {
 }
 
 impl AppState {
-    pub fn new(orchestrator: Arc<Orchestrator>, user_store: UserStore) -> Self {
+    pub fn new(
+        orchestrator: Arc<Orchestrator>,
+        user_store: UserStore,
+        allowed_origins: Vec<String>,
+    ) -> Self {
         Self {
             orchestrator,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             user_store: Arc::new(user_store),
-            allowed_origins: vec![
-                "http://localhost:5173".to_string(),
-                "http://127.0.0.1:5173".to_string(),
-            ],
+            allowed_origins,
             tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -166,36 +167,25 @@ pub async fn chat_handler(
         None => Uuid::new_v4(),
     };
 
-    // 取出或新建会话（克隆出副本，避免在长 LLM 调用期间持 sessions 锁）。
+    // 取出或新建会话：只取共享 history Arc，不深拷 messages（R2-SRV-004）。
     // 跨用户访问既存 session_id 返回 404 不泄漏存在性。
-    let mut data = {
+    let history_arc = {
         let sessions = state.sessions.read().await;
         match sessions.get(&session_id) {
-            Some(d) if d.user_id == user.id => d.clone(),
+            Some(d) if d.user_id == user.id => d.history.clone(),
             Some(_) => {
                 return Err((StatusCode::NOT_FOUND, "session not found".into()));
             }
-            None => SessionData {
-                session: Session {
-                    id: session_id,
-                    created_at: Utc::now(),
-                    messages: Vec::new(),
-                },
-                history: Arc::new(RwLock::new(History::new())),
-                user_id: user.id,
-            },
+            None => Arc::new(RwLock::new(History::new())),
         }
     };
-    data.session
-        .messages
-        .push(Message::User(req.message.clone()));
 
     // 持 history 写锁跑 run_once，避免并发请求丢失更新（SRV-007）。
     let event = {
-        let mut history_guard = data.history.write().await;
+        let mut history_guard = history_arc.write().await;
         state
             .orchestrator
-            .run_once(&mut history_guard, req.message)
+            .run_once(&mut history_guard, req.message.clone())
             .await
             .map_err(internal_error)?
     };
@@ -223,17 +213,38 @@ pub async fn chat_handler(
         .map(|r| ToolCall {
             id: r.id.clone(),
             tool: r.name.clone(),
-            input: serde_json::Value::Null,
+            input: r.input.clone(),
         })
         .collect();
-    data.session.messages.push(Message::Assistant(AssistantMsg {
-        text: text.clone(),
-        tool_calls: assistant_tool_calls,
-    }));
-
+    // R2-SRV-004：写回时 append 新消息而非整体 insert，避免并发请求互相覆盖。
+    let new_messages = vec![
+        Message::User(req.message.clone()),
+        Message::Assistant(AssistantMsg {
+            text: text.clone(),
+            tool_calls: assistant_tool_calls,
+        }),
+    ];
     {
         let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id, data);
+        match sessions.get_mut(&session_id) {
+            Some(d) => {
+                d.session.messages.extend(new_messages);
+            }
+            None => {
+                sessions.insert(
+                    session_id,
+                    SessionData {
+                        session: Session {
+                            id: session_id,
+                            created_at: Utc::now(),
+                            messages: new_messages,
+                        },
+                        history: history_arc,
+                        user_id: user.id,
+                    },
+                );
+            }
+        }
     }
 
     Ok(Json(ChatResponseDto {

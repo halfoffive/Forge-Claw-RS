@@ -75,6 +75,12 @@ async function send(): Promise<void> {
     return
   }
 
+  // F-12: 新会话由前端预生成 session_id，后端据此创建并复用同一会话，
+  // 避免后端 WS 流不回传 session_id 导致每条消息开新会话。
+  if (!session.currentId) {
+    session.setCurrentId(crypto.randomUUID())
+  }
+
   const payload: WsChatRequest = {
     message: text,
     ...(session.currentId ? { session_id: session.currentId } : {}),
@@ -90,8 +96,14 @@ async function send(): Promise<void> {
     errorMsg.value = 'WebSocket 连接错误'
   }
   ws.onclose = () => {
+    // F-08: 区分正常/异常关闭。streaming 中被服务端断开视为异常。
+    if (status.value === 'streaming') {
+      errorMsg.value = '连接中断，回复可能不完整'
+    }
+    if (status.value !== 'error') {
+      status.value = 'idle'
+    }
     sending.value = false
-    if (status.value === 'streaming') status.value = 'idle'
   }
 }
 
@@ -113,8 +125,14 @@ function onFrame(raw: string, assistantIdx: number): void {
       break
     }
     case 'tool_call_start': {
-      const call: ToolCall = { name: event.name, input: event.input }
-      session.pushMessage({ Tool: [call, {}] })
+      // F-01: ToolCall 字段对齐后端 { id, tool, input }。
+      const call: ToolCall = {
+        id: crypto.randomUUID(),
+        tool: event.name,
+        input: event.input,
+      }
+      // F-03: 占位 result 须满足必填字段，待 tool_result 回填。
+      session.pushMessage({ Tool: [call, { output: '', duration_ms: 0 }] })
       scrollToBottom()
       break
     }
@@ -123,7 +141,7 @@ function onFrame(raw: string, assistantIdx: number): void {
       const result: ToolResult = event.result
       for (let i = session.currentMessages.length - 1; i >= 0; i--) {
         const m = session.currentMessages[i]
-        if ('Tool' in m && m.Tool[0].name === event.name) {
+        if ('Tool' in m && m.Tool[0].tool === event.name) {
           const [, prev] = m.Tool
           if (!prev.output && !prev.error) {
             m.Tool[1] = result
@@ -137,7 +155,9 @@ function onFrame(raw: string, assistantIdx: number): void {
       const m = session.currentMessages[assistantIdx]
       if (m && 'Assistant' in m) {
         m.Assistant.text = event.text || m.Assistant.text
-        m.Assistant.tool_calls = event.tool_calls ?? []
+        // F-02: complete.tool_calls 是 ToolCallRecord[]（含 result），
+        // 与 Assistant.tool_calls(ToolCall[]) 形状不同，且工具调用已由
+        // 上方 Tool 消息承载，这里不再覆盖。
       }
       status.value = 'idle'
       sending.value = false
@@ -171,8 +191,18 @@ onUnmounted(cleanupWs)
 function startNew(): void {
   cleanupWs()
   session.newSession()
+  // F-12: 预生成 session_id，发送时回传后端，前端已知 id。
+  session.setCurrentId(crypto.randomUUID())
   status.value = 'idle'
   errorMsg.value = ''
+  // F-09: streaming 中点击新会话需重置 sending，避免按钮卡死。
+  sending.value = false
+}
+
+// F-27: 中文输入法 composing 期间不触发发送。
+function onEnter(e: KeyboardEvent): void {
+  if (e.isComposing) return
+  send()
 }
 </script>
 
@@ -205,7 +235,7 @@ function startNew(): void {
         <div v-else class="msg tool">
           <div class="tool-card">
             <div class="tool-head">
-              <span class="tool-name">{{ m.Tool[0].name }}</span>
+              <span class="tool-name">{{ m.Tool[0].tool }}</span>
               <span
                 class="tool-state"
                 :class="{ ok: !!m.Tool[1].output, err: !!m.Tool[1].error }"
@@ -230,7 +260,7 @@ function startNew(): void {
         rows="2"
         placeholder="输入消息，Enter 发送，Shift+Enter 换行"
         :disabled="sending"
-        @keydown.enter.exact.prevent="send"
+        @keydown.enter.exact.prevent="onEnter"
       />
       <button class="send" type="submit" :disabled="sending || !input.trim()">
         发送

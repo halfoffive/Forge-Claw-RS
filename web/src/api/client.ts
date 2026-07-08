@@ -85,6 +85,10 @@ async function request<T>(
     } catch {
       /* ignore */
     }
+    // F-19: 401 时通知应用层清理登录态并跳转登录页（避免 client 直接依赖 store/router）。
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('forgeclaw:unauthorized'))
+    }
     throw new ApiError(401, msg)
   }
 
@@ -124,8 +128,8 @@ export function getSession(token: string, id: string): Promise<SessionDetail> {
 }
 
 /** `GET /api/tools`：列出可用工具。 */
-export function listTools(token: string): Promise<ToolInfo[]> {
-  return request<ToolInfo[]>('/api/tools', token)
+export function listTools(token: string): Promise<{ tools: ToolInfo[] }> {
+  return request<{ tools: ToolInfo[] }>('/api/tools', token)
 }
 
 /** `POST /api/prompts/compile`：编译指定 profile 的 system prompt。 */

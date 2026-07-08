@@ -67,6 +67,8 @@ pub enum OrchestratorEvent {
 pub struct ToolCallRecord {
     pub id: String,
     pub name: String,
+    /// 解析后的工具调用入参（R2-SRV-008：供 api/ws 回填 Session.messages 的 ToolCall.input）。
+    pub input: Value,
     pub result: ToolResult,
 }
 
@@ -195,8 +197,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 派发子代理：受限沙箱（只读工具）+ 角色 system prompt，跑最多 5 轮，
-    /// 仅返回最终 summary 文本（隔离上下文，省 token）。
+    /// 派发子代理：受限沙箱（只读工具）+ 角色 system prompt，跑一轮 run_turn
+    /// （内部已含完整工具循环），仅返回最终 summary 文本（隔离上下文，省 token）。
     pub async fn dispatch_subagent(
         &self,
         role: SubagentRole,
@@ -206,25 +208,26 @@ impl Orchestrator {
         let sandbox = Arc::new(sandbox);
         let system_prompt = subagent_system_prompt(role);
         let mut history = History::with_system(system_prompt);
-        let mut msg = task;
-        for _round in 0..5 {
-            match self
-                .run_turn(
-                    &sandbox,
-                    &tool_specs,
-                    &mut history,
-                    std::mem::take(&mut msg),
-                    None,
-                    DEFAULT_MAX_TURNS,
-                )
-                .await
-            {
-                Ok(OrchestratorEvent::Complete { text, .. }) => return Ok(text),
-                Ok(_) => continue,
-                Err(e) => return Err(e),
+        // R2-SRV-003：run_turn 内部已含完整工具循环，无需外层 for 循环；
+        // 旧实现 std::mem::take 清空 msg 后 continue 传空消息，已移除。
+        match self
+            .run_turn(
+                &sandbox,
+                &tool_specs,
+                &mut history,
+                task,
+                None,
+                DEFAULT_MAX_TURNS,
+            )
+            .await
+        {
+            Ok(OrchestratorEvent::Complete { text, .. }) => Ok(text),
+            Ok(OrchestratorEvent::Error { message }) => {
+                Err(anyhow::anyhow!("subagent error: {message}"))
             }
+            Err(e) => Err(e),
+            Ok(other) => Err(anyhow::anyhow!("subagent unexpected event: {other:?}")),
         }
-        Ok("subagent: rounds exhausted".to_string())
     }
 
     /// 核心单轮循环：append user → 反复 (LLM 调用 → 工具执行 → 回填) 直到无工具调用。
@@ -246,7 +249,10 @@ impl Orchestrator {
         tx: Option<&mpsc::Sender<OrchestratorEvent>>,
         max_turns: usize,
     ) -> anyhow::Result<OrchestratorEvent> {
-        history.append(ChatMessage::user(user_msg));
+        // R2-SRV-002：在 temp 副本上操作，错误路径直接 return 不写回，
+        // 保证 history 不残留半截 tool_calls 导致下次请求 400。
+        let mut temp = history.clone();
+        temp.append(ChatMessage::user(user_msg));
         let mut records: Vec<ToolCallRecord> = Vec::new();
 
         let mut turn = 0usize;
@@ -263,7 +269,7 @@ impl Orchestrator {
             }
 
             let req = ChatRequest::from_history(
-                history,
+                &temp,
                 &self.model,
                 Some(0.0),
                 None,
@@ -333,7 +339,7 @@ impl Orchestrator {
                     tool_call_id: None,
                 }
             };
-            history.append(assistant_msg);
+            temp.append(assistant_msg);
 
             if tcs.is_empty() {
                 let event = OrchestratorEvent::Complete {
@@ -342,16 +348,24 @@ impl Orchestrator {
                 };
                 if let Some(tx) = tx {
                     if tx.send(event.clone()).await.is_err() {
+                        // 客户端断开：不 commit，history 保持原样（R2-SRV-002）。
                         return Ok(OrchestratorEvent::Error {
                             message: "client disconnected".into(),
                         });
                     }
                 }
+                // 成功完成：把 temp 写回 history（R2-SRV-002）。
+                *history = temp;
                 return Ok(event);
             }
 
             for agg in tcs.into_values() {
                 let parsed = parse_tool_input(&agg.arguments);
+                // R2-SRV-008：记录解析后的 input 供 ToolCallRecord 携带。
+                let input_value = match &parsed {
+                    Ok(v) => v.clone(),
+                    Err(_) => Value::Null,
+                };
                 // SRV-019：parse 失败时构造错误 ToolResult 回填，不执行工具。
                 let result = match parsed {
                     Ok(v) => {
@@ -418,15 +432,22 @@ impl Orchestrator {
                 records.push(ToolCallRecord {
                     id: agg.id.clone(),
                     name: agg.name.clone(),
+                    input: input_value,
                     result: result.clone(),
                 });
+                // R2-SRV-001：合并 error 进 content，避免工具失败时 LLM 收到空内容。
+                let content = if let Some(e) = &result.error {
+                    format!("error: {}\n{}", e, result.output)
+                } else {
+                    result.output.clone()
+                };
                 let tool_msg = ChatMessage {
                     role: "tool".into(),
-                    content: result.output,
+                    content,
                     tool_calls: None,
                     tool_call_id: Some(agg.id),
                 };
-                history.append(tool_msg);
+                temp.append(tool_msg);
             }
         }
     }

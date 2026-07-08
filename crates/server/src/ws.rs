@@ -26,11 +26,11 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use chrono::Utc;
-use forgeclaw_core::model::{AssistantMsg, Message as CoreMessage, Session};
+use forgeclaw_core::model::{AssistantMsg, Message as CoreMessage, Session, ToolCall};
 use forgeclaw_llm::History;
 
 use crate::api::{AppState, SessionData};
-use crate::orchestrator::OrchestratorEvent;
+use crate::orchestrator::{OrchestratorEvent, ToolCallRecord};
 
 /// WS 读帧超时（SRV-003）：60s 无帧即关闭。
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -165,12 +165,12 @@ async fn handle_text_frame(
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::new_v4);
 
-    // 取出或新建会话（克隆副本，避免在长 LLM 调用期间持 sessions 锁）。
+    // 取出或新建会话：只取共享 history Arc，不深拷 messages（R2-SRV-004）。
     // SRV-006：跨用户既存 session_id 发 Error 并 return，不创建不覆盖。
-    let mut data = {
+    let history_arc = {
         let sessions = state.sessions.read().await;
         match sessions.get(&session_id) {
-            Some(d) if d.user_id == user_id => d.clone(),
+            Some(d) if d.user_id == user_id => d.history.clone(),
             Some(_) => {
                 let _ = send_event(
                     out_tx,
@@ -181,39 +181,34 @@ async fn handle_text_frame(
                 .await;
                 return std::ops::ControlFlow::Continue(());
             }
-            None => SessionData {
-                session: Session {
-                    id: session_id,
-                    created_at: Utc::now(),
-                    messages: Vec::new(),
-                },
-                history: Arc::new(RwLock::new(History::new())),
-                user_id,
-            },
+            None => Arc::new(RwLock::new(History::new())),
         }
     };
-    data.session
-        .messages
-        .push(CoreMessage::User(req.message.clone()));
 
+    let user_msg_text = req.message.clone();
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(64);
     let orch = state.orchestrator.clone();
     let user_msg = req.message;
     // SRV-007：history 用 Arc<RwLock<History>> 共享，spawn 任务内持写锁跑 run_streaming，
     // 防止并发请求丢失更新。guard 在任务结束自动释放。
-    let history_arc = data.history.clone();
+    let history_for_task = history_arc.clone();
     let join = tokio::spawn(async move {
-        let mut guard = history_arc.write().await;
-        let res = orch.run_streaming(&mut guard, user_msg, tx).await;
-        (data, res)
+        let mut guard = history_for_task.write().await;
+        orch.run_streaming(&mut guard, user_msg, tx).await
     });
 
-    // 转发事件给 WS 客户端
+    // 转发事件给 WS 客户端，并捕获 Complete 的 tool_calls（R2-SRV-008）。
     let mut final_text = String::new();
+    let mut final_tool_calls: Vec<ToolCallRecord> = Vec::new();
     let mut got_complete = false;
     while let Some(event) = rx.recv().await {
-        if let OrchestratorEvent::Complete { ref text, .. } = event {
+        if let OrchestratorEvent::Complete {
+            ref text,
+            ref tool_calls,
+        } = event
+        {
             final_text = text.clone();
+            final_tool_calls = tool_calls.clone();
             got_complete = true;
         }
         if send_event(out_tx, &event).await.is_err() {
@@ -228,23 +223,50 @@ async fn handle_text_frame(
     }
     drop(rx);
 
-    // 回写会话。SRV-013：join.await 的 Err 分支记日志。
+    // 回写会话。R2-SRV-004：append 新消息而非整体 insert，避免并发覆盖。
+    // SRV-013：join.await 的 Err 分支记日志。
     match join.await {
-        Ok((mut final_data, res)) => {
+        Ok(res) => {
             if let Err(e) = res {
                 tracing::error!(error = %e, "run_streaming failed");
             }
             if got_complete {
-                final_data
-                    .session
-                    .messages
-                    .push(CoreMessage::Assistant(AssistantMsg {
+                let assistant_tool_calls: Vec<ToolCall> = final_tool_calls
+                    .iter()
+                    .map(|r| ToolCall {
+                        id: r.id.clone(),
+                        tool: r.name.clone(),
+                        input: r.input.clone(),
+                    })
+                    .collect();
+                let new_messages = vec![
+                    CoreMessage::User(user_msg_text),
+                    CoreMessage::Assistant(AssistantMsg {
                         text: final_text,
-                        tool_calls: Vec::new(),
-                    }));
+                        tool_calls: assistant_tool_calls,
+                    }),
+                ];
+                let mut sessions = state.sessions.write().await;
+                match sessions.get_mut(&session_id) {
+                    Some(d) => {
+                        d.session.messages.extend(new_messages);
+                    }
+                    None => {
+                        sessions.insert(
+                            session_id,
+                            SessionData {
+                                session: Session {
+                                    id: session_id,
+                                    created_at: Utc::now(),
+                                    messages: new_messages,
+                                },
+                                history: history_arc,
+                                user_id,
+                            },
+                        );
+                    }
+                }
             }
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(session_id, final_data);
         }
         Err(e) => {
             tracing::error!(error = %e, "orchestrator task join failed");

@@ -431,7 +431,8 @@ pub async fn run_web(cfg: Config, host: String, port: u16) -> anyhow::Result<()>
         }
     }
     let user_store = UserStore::from_config(users.clone());
-    let state = AppState::new(orch, user_store);
+    let allowed_origins = resolve_allowed_origins(&cfg, &host, port);
+    let state = AppState::new(orch, user_store, allowed_origins);
     let addr = SocketAddr::new(host.parse()?, port);
     println!("ForgeClaw Web 服务已启动: http://{host}:{port}");
     println!(
@@ -467,6 +468,27 @@ fn resolve_users(cfg: &Config) -> Vec<(String, String)> {
     } else {
         cfg.users.clone()
     }
+}
+
+/// 解析 CORS 白名单：`config.allowed_origins` 非空则用之，否则用代码默认值
+/// （vite dev 5173）；非回环 host 追加 `http://{host}:{port}`（SRV-001）。
+fn resolve_allowed_origins(cfg: &Config, host: &str, port: u16) -> Vec<String> {
+    let mut origins = if cfg.allowed_origins.is_empty() {
+        vec![
+            "http://127.0.0.1:5173".to_string(),
+            "http://localhost:5173".to_string(),
+        ]
+    } else {
+        cfg.allowed_origins.clone()
+    };
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    if !is_loopback {
+        let origin = format!("http://{host}:{port}");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    origins
 }
 
 // ============ config ============
@@ -608,6 +630,33 @@ mod tests {
         };
         let u = resolve_users(&cfg);
         assert_eq!(u[0].0, "alice");
+    }
+
+    #[test]
+    fn resolve_allowed_origins_default_loopback() {
+        let cfg = Config::default();
+        let origins = resolve_allowed_origins(&cfg, "127.0.0.1", 8080);
+        assert!(origins.contains(&"http://127.0.0.1:5173".to_string()));
+        assert!(origins.contains(&"http://localhost:5173".to_string()));
+        // 回环 host 不追加自身端口
+        assert!(!origins.contains(&"http://127.0.0.1:8080".to_string()));
+    }
+
+    #[test]
+    fn resolve_allowed_origins_non_loopback_appends_host_port() {
+        let cfg = Config::default();
+        let origins = resolve_allowed_origins(&cfg, "0.0.0.0", 8080);
+        assert!(origins.contains(&"http://0.0.0.0:8080".to_string()));
+    }
+
+    #[test]
+    fn resolve_allowed_origins_uses_config_when_non_empty() {
+        let cfg = Config {
+            allowed_origins: vec!["http://custom.example".into()],
+            ..Config::default()
+        };
+        let origins = resolve_allowed_origins(&cfg, "127.0.0.1", 8080);
+        assert_eq!(origins, vec!["http://custom.example".to_string()]);
     }
 
     #[tokio::test]

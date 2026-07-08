@@ -28,17 +28,24 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
-use axum::http::{header, HeaderValue, Method, Request as HttpRequest};
+use axum::http::{header, HeaderValue, Method, Request as HttpRequest, StatusCode};
 use axum::middleware::from_fn_with_state;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use forgeclaw_llm::OpenAiClient;
+use rust_embed::RustEmbed;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::GovernorLayer;
 use tower_http::{
     compression::CompressionLayer, cors::AllowOrigin, cors::CorsLayer, timeout::TimeoutLayer,
     trace::TraceLayer,
 };
+
+/// 嵌入 web/dist 静态资源（SPA）。编译期打包，运行时零文件 IO。
+#[derive(RustEmbed)]
+#[folder = "../../web/dist"]
+struct Asset;
 
 /// Orchestrator 构造配置。
 pub struct OrchestratorConfig {
@@ -62,6 +69,60 @@ fn build_cors_layer(state: &AppState) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+/// 按扩展名推断 MIME（避免引入 mime_guess 依赖）。
+fn mime_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+/// SPA 静态资源 fallback：先查嵌入资源，未命中回 index.html（客户端路由）。
+/// `/api/*` 与 `/ws/*` 不拦截，交给原路由/404，避免 API 误返回 HTML。
+async fn static_handler(req: axum::extract::Request) -> Response {
+    let uri_path = req.uri().path();
+    if uri_path.starts_with("/api/") || uri_path.starts_with("/ws/") {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let path = uri_path.trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    if let Some(file) = Asset::get(path) {
+        return (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(mime_for(path)),
+            )],
+            file.data.into_owned(),
+        )
+            .into_response();
+    }
+    // SPA fallback：未命中的非资源路径回 index.html，交给前端路由。
+    if let Some(index) = Asset::get("index.html") {
+        return (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            )],
+            index.data.into_owned(),
+        )
+            .into_response();
+    }
+    (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
 /// 装配 axum Router：REST + WebSocket + tower-http 中间件 + auth 中间件。
@@ -100,6 +161,8 @@ pub fn app(state: AppState) -> Router {
         .merge(protected)
         .merge(login)
         .route("/ws/chat", get(ws::ws_chat_handler))
+        // SPA 静态资源 fallback：未匹配 /api、/ws 的路径交给嵌入资源处理。
+        .fallback(static_handler)
         // 内→外依次添加：DefaultBodyLimit → TimeoutLayer → CompressionLayer → CorsLayer → TraceLayer
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(TimeoutLayer::with_status_code(

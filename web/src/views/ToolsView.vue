@@ -18,10 +18,7 @@ async function load(): Promise<void> {
   error.value = ''
   try {
     const data = await listTools(auth.token)
-    // 后端实际返回 { tools: [...] }，兼容直接数组形态。
-    tools.value = Array.isArray(data)
-      ? data
-      : (data as unknown as { tools?: ToolInfo[] }).tools ?? []
+    tools.value = data.tools
   } catch (e) {
     error.value = (e as Error).message
   } finally {

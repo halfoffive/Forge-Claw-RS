@@ -22,15 +22,24 @@ export interface TicketResponse {
 
 /** 工具调用记录。 */
 export interface ToolCall {
-  name: string
+  id: string
+  tool: string
   input: unknown
 }
 
 /** 工具执行结果。 */
 export interface ToolResult {
-  output?: string
-  error?: string
-  duration_ms?: number
+  output: string
+  duration_ms: number
+  error?: string | null
+}
+
+/** Complete 帧汇总的工具调用记录（含结果）。 */
+export interface ToolCallRecord {
+  id: string
+  name: string
+  input?: unknown
+  result: ToolResult
 }
 
 /**
@@ -76,7 +85,7 @@ export type OrchestratorEvent =
   | { type: 'delta'; text: string }
   | { type: 'tool_call_start'; name: string; input: unknown }
   | { type: 'tool_result'; name: string; result: ToolResult }
-  | { type: 'complete'; text: string; tool_calls: ToolCall[] }
+  | { type: 'complete'; text: string; tool_calls: ToolCallRecord[] }
   | { type: 'error'; message: string }
 
 /** WS 客户端发送帧。 */
