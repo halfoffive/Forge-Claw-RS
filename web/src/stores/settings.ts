@@ -1,27 +1,24 @@
+// 设置 store：服务器地址（API base），持久化到 localStorage。
+// 切换 server 后通过 setApiBase 同步给 api/client。
+
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { getServerUrl, setServerUrl as saveServerUrl } from '../api/client'
 
-const MODEL_KEY = 'forgeclaw_model'
+import { setApiBase } from '@/api/client'
+
+const SERVER_KEY = 'forgeclaw.server'
 
 export const useSettingsStore = defineStore('settings', () => {
-  const serverUrl = ref(getServerUrl() || '')
-  const model = ref(localStorage.getItem(MODEL_KEY) || 'deepseek-chat')
+  const server = ref<string>(localStorage.getItem(SERVER_KEY) ?? '')
 
-  function setServerUrl(url: string) {
-    serverUrl.value = url
-    saveServerUrl(url)
+  // 初始化时同步一次到 client（空串 = 走相对路径/vite 代理）。
+  setApiBase(server.value)
+
+  function setServer(value: string): void {
+    server.value = value.trim()
+    localStorage.setItem(SERVER_KEY, server.value)
+    setApiBase(server.value)
   }
 
-  function setModel(value: string) {
-    model.value = value
-    localStorage.setItem(MODEL_KEY, value)
-  }
-
-  return {
-    serverUrl,
-    model,
-    setServerUrl,
-    setModel,
-  }
+  return { server, setServer }
 })

@@ -1,113 +1,172 @@
-const DEFAULT_TIMEOUT_MS = 30_000
-const TOKEN_KEY = 'forgeclaw_token'
-const SERVER_URL_KEY = 'forgeclaw_server_url'
+// ForgeClaw API 客户端：fetch 封装 + WS ticket 辅助。
+//
+// 设计要点：
+// - 所有 REST 请求自动注入 `Authorization: Bearer <token>`（由调用方传入）。
+// - 30s 超时（AbortController），401 抛 ApiError 以便上层清理会话。
+// - base 默认相对路径（依赖 vite 代理 /api → localhost:8080）；
+//   settings store 可通过 setApiBase 切换到其他后端地址。
+// - WS 走一次性 ticket：先 GET /api/auth/ticket，再拼 ws(s)://host/ws/chat?ticket=。
 
+import type {
+  LoginResponse,
+  SessionDetail,
+  SessionSummary,
+  TicketResponse,
+  ToolInfo,
+} from './types'
+
+/** API 错误（携带状态码与后端消息）。 */
 export class ApiError extends Error {
-  status?: number
-  code?: string
-
-  constructor(message: string, status?: number, code?: string) {
+  status: number
+  constructor(status: number, message: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
-    this.code = code
   }
 }
 
-export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY)
+/** 默认 30s 请求超时。 */
+const DEFAULT_TIMEOUT_MS = 30_000
+
+/** 模块级 API base，默认相对路径（走 vite 代理）。 */
+let apiBase = ''
+
+/** 设置 API base（由 settings store 调用）。传空串恢复相对路径。 */
+export function setApiBase(base: string): void {
+  apiBase = base.replace(/\/+$/, '')
 }
 
-export function setToken(token: string | null): void {
-  if (token) localStorage.setItem(TOKEN_KEY, token)
-  else localStorage.removeItem(TOKEN_KEY)
-}
-
-export function getServerUrl(): string {
-  return localStorage.getItem(SERVER_URL_KEY) || ''
-}
-
-export function setServerUrl(url: string): void {
-  localStorage.setItem(SERVER_URL_KEY, url)
-}
-
-function buildBaseUrl(): string {
-  return getServerUrl().replace(/\/$/, '')
-}
-
+/** 拼接完整 URL。 */
 function buildUrl(path: string): string {
-  const base = buildBaseUrl()
-  if (!base) return path
-  const sep = path.startsWith('/') ? '' : '/'
-  return `${base}${sep}${path}`
+  if (!path.startsWith('/')) path = '/' + path
+  return apiBase ? apiBase + path : path
 }
 
-function redirectToLogin(): void {
-  localStorage.removeItem(TOKEN_KEY)
-  window.location.href = '#/login'
-}
+/** 核心 fetch 封装：注入 Bearer、30s 超时、401 抛 ApiError。 */
+async function request<T>(
+  path: string,
+  token: string,
+  init: RequestInit = {},
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const url = buildUrl(path)
-  const token = getToken()
-
-  const headers = new Headers(options.headers)
-  headers.set('Accept', 'application/json')
-  if (!(options.body instanceof FormData)) {
-    headers.set('Content-Type', 'application/json')
+  const headers: Record<string, string> = {
+    ...(init.headers as Record<string, string> | undefined),
+  }
+  if (init.body !== undefined && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json'
   }
   if (token) {
-    headers.set('Authorization', `Bearer ${token}`)
+    headers['Authorization'] = `Bearer ${token}`
   }
 
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort('timeout'), DEFAULT_TIMEOUT_MS)
-
+  let res: Response
   try {
-    const res = await fetch(url, {
-      ...options,
+    res = await fetch(buildUrl(path), {
+      ...init,
       headers,
       signal: controller.signal,
     })
-
-    if (res.status === 401) {
-      redirectToLogin()
-      throw new ApiError('Unauthorized', 401, 'UNAUTHORIZED')
+  } catch (e) {
+    if (controller.signal.aborted) {
+      throw new ApiError(0, `请求超时（${timeoutMs}ms）：${path}`)
     }
-
-    if (!res.ok) {
-      let message = `HTTP ${res.status}`
-      try {
-        const body = await res.json()
-        if (body.error) message = body.error
-      } catch {
-        // ignore parse failure
-      }
-      throw new ApiError(message, res.status, 'HTTP_ERROR')
-    }
-
-    if (res.status === 204) {
-      return undefined as T
-    }
-    return (await res.json()) as T
-  } catch (err) {
-    controller.abort()
-    if (err instanceof ApiError) throw err
-    if (err instanceof Error && err.name === 'AbortError') {
-      throw new ApiError('Request timeout', undefined, 'TIMEOUT')
-    }
-    throw new ApiError(err instanceof Error ? err.message : String(err), undefined, 'NETWORK')
+    throw new ApiError(0, `网络错误：${(e as Error).message}`)
   } finally {
-    clearTimeout(timeoutId)
+    clearTimeout(timer)
   }
+
+  if (res.status === 401) {
+    let msg = '未授权'
+    try {
+      msg = (await res.json())?.error ?? msg
+    } catch {
+      /* ignore */
+    }
+    // F-19: 401 时通知应用层清理登录态并跳转登录页（避免 client 直接依赖 store/router）。
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('forgeclaw:unauthorized'))
+    }
+    throw new ApiError(401, msg)
+  }
+
+  const text = await res.text()
+  const body = text ? JSON.parse(text) : null
+  if (!res.ok) {
+    const msg = (body && (body.error || body.message)) || `HTTP ${res.status}`
+    throw new ApiError(res.status, msg)
+  }
+  return body as T
 }
 
-export const api = {
-  get: <T>(path: string) => request<T>(path, { method: 'GET' }),
-  post: <T>(path: string, body: unknown) => request<T>(path, { method: 'POST', body: JSON.stringify(body) }),
+/** `POST /api/auth/login`：用 name+token 换取登录态与首张 WS ticket。 */
+export function login(
+  name: string,
+  token: string,
+): Promise<LoginResponse> {
+  return request<LoginResponse>('/api/auth/login', '', {
+    method: 'POST',
+    body: JSON.stringify({ name, token }),
+  })
 }
 
-export async function getWsTicket(): Promise<string> {
-  const res = await api.get<{ ticket: string }>('/api/auth/ticket')
-  return res.ticket
+/** `GET /api/auth/ticket`：换取一次性 WS ticket（需 Bearer）。 */
+export function getWsTicket(token: string): Promise<string> {
+  return request<TicketResponse>('/api/auth/ticket', token).then((r) => r.ticket)
+}
+
+/** `GET /api/sessions`：列出当前用户会话摘要。 */
+export function listSessions(token: string): Promise<SessionSummary[]> {
+  return request<SessionSummary[]>('/api/sessions', token)
+}
+
+/** `GET /api/sessions/:id`：获取会话详情（含消息）。 */
+export function getSession(token: string, id: string): Promise<SessionDetail> {
+  return request<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`, token)
+}
+
+/** `GET /api/tools`：列出可用工具。 */
+export function listTools(token: string): Promise<{ tools: ToolInfo[] }> {
+  return request<{ tools: ToolInfo[] }>('/api/tools', token)
+}
+
+/** `POST /api/prompts/compile`：编译指定 profile 的 system prompt。 */
+export function compilePrompt(
+  token: string,
+  profile: string,
+): Promise<{ prompt: string }> {
+  return request<{ prompt: string }>('/api/prompts/compile', token, {
+    method: 'POST',
+    body: JSON.stringify({ profile }),
+  })
+}
+
+/** `GET /api/prompts/sections?profile=`：列出 profile 启用的章节。 */
+export function listSections(
+  token: string,
+  profile: string,
+): Promise<unknown[]> {
+  return request<unknown[]>(
+    `/api/prompts/sections?profile=${encodeURIComponent(profile)}`,
+    token,
+  )
+}
+
+/**
+ * 拼接 WebSocket URL：`ws(s)://host/ws/chat?ticket=<ticket>`。
+ * host 取自 apiBase（若已配置绝对地址）或当前页面 origin。
+ */
+export function buildWsUrl(ticket: string): string {
+  let origin: string
+  if (apiBase && /^https?:\/\//.test(apiBase)) {
+    origin = apiBase.replace(/^http/, 'ws')
+  } else if (typeof window !== 'undefined') {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    origin = `${proto}//${window.location.host}`
+  } else {
+    origin = 'ws://localhost:8080'
+  }
+  return `${origin}/ws/chat?ticket=${encodeURIComponent(ticket)}`
 }

@@ -66,14 +66,16 @@ struct StreamToolFunction {
 /// - 合法 JSON chunk → 解析 `choices[*].delta`，产出 [`Event::Delta`] / [`Event::ToolCallDelta`]
 /// - 非法 JSON → 跳过该块（不致命）
 pub fn parse_sse_events(data: &str) -> Vec<Event> {
+    // 兼容 \r\n / \r 行结束符，统一归一化为 \n 后再切分。
+    let data = data.replace("\r\n", "\n").replace('\r', "\n");
     let mut out = Vec::new();
     for block in data.split("\n\n") {
         let mut payload_parts: Vec<&str> = Vec::new();
         for line in block.lines() {
-            if let Some(rest) = line.strip_prefix("data: ") {
+            // 先剥离 `data:` 前缀，再选择性剥离单个前导空格（兼容 `data:` 与 `data: ` 两种写法）。
+            if let Some(rest) = line.strip_prefix("data:") {
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
                 payload_parts.push(rest);
-            } else if line == "data:" {
-                payload_parts.push("");
             }
         }
         if payload_parts.is_empty() {
@@ -86,7 +88,7 @@ pub fn parse_sse_events(data: &str) -> Vec<Event> {
         }
         match serde_json::from_str::<StreamChunk>(&payload) {
             Ok(chunk) => out.extend(chunk_to_events(chunk)),
-            Err(_) => continue, // 跳过非法 JSON 块（不致命）
+            Err(e) => tracing::warn!("invalid sse json: {e}"),
         }
     }
     out
@@ -129,14 +131,14 @@ where
 {
     struct State<S> {
         inner: S,
-        buf: String,
+        buf: Vec<u8>,
         pending: std::collections::VecDeque<Event>,
         done: bool,
     }
 
     let init = State {
         inner: s,
-        buf: String::new(),
+        buf: Vec::new(),
         pending: std::collections::VecDeque::new(),
         done: false,
     };
@@ -153,7 +155,7 @@ where
                 None => {
                     st.done = true;
                     if !st.buf.is_empty() {
-                        let evs = parse_sse_events(&st.buf);
+                        let evs = parse_sse_events(&String::from_utf8_lossy(&st.buf));
                         st.buf.clear();
                         for ev in evs {
                             st.pending.push_back(ev);
@@ -162,14 +164,17 @@ where
                     continue;
                 }
                 Some(Err(e)) => {
+                    // 流持续出错时终止整流，避免无限错误循环。
+                    st.done = true;
                     return Some((Event::Error(e.to_string()), st));
                 }
                 Some(Ok(bytes)) => {
-                    st.buf.push_str(&String::from_utf8_lossy(bytes.as_ref()));
-                    while let Some(idx) = st.buf.find("\n\n") {
-                        let block: String = st.buf[..idx].into();
-                        st.buf = st.buf[idx + 2..].into();
-                        for ev in parse_sse_events(&block) {
+                    // 累积原始字节，避免分块边界上的 lossy 转换丢字节。
+                    st.buf.extend_from_slice(bytes.as_ref());
+                    while let Some((idx, sep_len)) = next_sse_boundary(&st.buf) {
+                        let block: Vec<u8> = st.buf.drain(..idx).collect();
+                        st.buf.drain(..sep_len);
+                        for ev in parse_sse_events(&String::from_utf8_lossy(&block)) {
                             st.pending.push_back(ev);
                         }
                     }
@@ -180,6 +185,19 @@ where
     })
 }
 
+/// 在字节缓冲中查找最早的 SSE 事件边界：`\n\n` 或 `\r\n\r\n`（兼容 CRLF）。
+/// 返回 `(边界起始位置, 分隔符字节长度)`。
+fn next_sse_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+    let n2 = buf.windows(2).position(|w| w == b"\n\n");
+    let r4 = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    match (n2, r4) {
+        (Some(a), Some(b)) => Some(if a <= b { (a, 2) } else { (b, 4) }),
+        (Some(a), None) => Some((a, 2)),
+        (None, Some(b)) => Some((b, 4)),
+        (None, None) => None,
+    }
+}
+
 // ============ OpenAiClient（兼容 DeepSeek/GLM） ============
 
 /// OpenAI 兼容协议客户端。POST `{base_url}/chat/completions`，SSE 流式。
@@ -187,8 +205,6 @@ pub struct OpenAiClient {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
-    #[allow(dead_code)]
-    timeout: Duration,
 }
 
 impl OpenAiClient {
@@ -203,7 +219,6 @@ impl OpenAiClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             http,
-            timeout,
         })
     }
 
@@ -259,7 +274,17 @@ impl LlmClient for OpenAiClient {
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("HTTP {}: {}", status, text);
+            // 截断到前 512 字节，避免超大错误响应撑爆日志/上下文。
+            let truncated: &str = if text.len() > 512 {
+                let mut end = 512;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &text[..end]
+            } else {
+                &text
+            };
+            anyhow::bail!("HTTP {}: {}", status, truncated);
         }
         let byte_stream = response.bytes_stream();
         let event_stream = parse_sse_stream(byte_stream);
@@ -355,6 +380,42 @@ mod tests {
         let ev = parse_sse_events(sse);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0], Event::Delta("a".into()));
+    }
+
+    #[test]
+    fn parse_sse_events_handles_crlf_line_endings() {
+        // \r\n 行结束符与 \r\n\r\n 事件分隔符都应被正确解析。
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let ev = parse_sse_events(sse);
+        assert_eq!(ev.len(), 3);
+        assert_eq!(ev[0], Event::Delta("He".into()));
+        assert_eq!(ev[1], Event::Delta("llo".into()));
+        assert_eq!(ev[2], Event::Done);
+    }
+
+    #[test]
+    fn parse_sse_events_data_without_space() {
+        // `data:` 后无空格也应解析。
+        let sse = "data:{\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata:[DONE]\n\n";
+        let ev = parse_sse_events(sse);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[0], Event::Delta("x".into()));
+        assert_eq!(ev[1], Event::Done);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_handles_crlf_boundaries() {
+        let bytes: Vec<Result<Vec<u8>, reqwest::Error>> = vec![Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n"
+                .to_vec(),
+        )];
+        let src = futures::stream::iter(bytes);
+        let mut s = Box::pin(parse_sse_stream(src));
+        let mut got = Vec::new();
+        while let Some(ev) = s.next().await {
+            got.push(ev);
+        }
+        assert_eq!(got, vec![Event::Delta("hi".into()), Event::Done]);
     }
 
     #[tokio::test]

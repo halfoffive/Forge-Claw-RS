@@ -27,7 +27,7 @@ pub struct FunctionCallDto {
     pub arguments: String,
 }
 
-/// 聊天消息角色。
+/// 聊天角色。序列化为小写字符串：`system` / `user` / `assistant` / `tool`。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -35,6 +35,30 @@ pub enum Role {
     User,
     Assistant,
     Tool,
+}
+
+impl Role {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        }
+    }
+}
+
+impl From<&str> for Role {
+    fn from(s: &str) -> Self {
+        match s {
+            "system" => Role::System,
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "tool" => Role::Tool,
+            // 未知值回落为 user（不致命，避免 infallible 转换 panic）。
+            _ => Role::User,
+        }
+    }
 }
 
 /// 一条聊天消息。`role` ∈ `system` / `user` / `assistant` / `tool`。
@@ -79,6 +103,7 @@ impl ChatMessage {
         }
     }
 
+    /// 工具结果消息：`role=tool`，`tool_call_id` 指向被回复的工具调用。
     pub fn tool(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
@@ -292,10 +317,15 @@ mod tests {
 
     #[test]
     fn chatmessage_tool_role_serializes_tool_call_id() {
-        let m = ChatMessage::tool("42", "call_1");
+        let m = ChatMessage {
+            role: Role::Tool,
+            content: "42".into(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+        };
         let j = serde_json::to_string(&m).unwrap();
-        assert!(j.contains("\"role\":\"tool\""));
         assert!(j.contains("\"tool_call_id\":\"call_1\""));
+        assert!(j.contains("\"role\":\"tool\""));
         assert!(!j.contains("tool_calls"));
     }
 }

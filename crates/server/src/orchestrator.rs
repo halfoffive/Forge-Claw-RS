@@ -2,7 +2,7 @@
 //!
 //! 设计要点：
 //! - [`Orchestrator`] 持有 `Arc<dyn LlmClient>` / `Arc<Sandbox>` 与 tool spec 清单，
-//!   `PromptEngine` 的 `compile` 为 `&self`，内部用 `RwLock` 保护缓存，临界区极短。
+//!   `PromptEngine` 用 `tokio::sync::Mutex` 包裹（其 `compile` 为 `&mut self`）。
 //! - [`Orchestrator::run_once`] 为同步阻塞语义：跑完一轮或多轮工具循环后返回最终文本。
 //! - [`Orchestrator::run_streaming`] 通过 `tokio::sync::mpsc` 桥接为事件流，供 WebSocket 用。
 //! - [`Orchestrator::dispatch_subagent`] 用受限沙箱（只读工具）+ 角色 system prompt 隔离上下文。
@@ -27,6 +27,10 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::warn;
+use uuid::Uuid;
+
+/// run_turn 默认最大轮数（SRV-004）。
+const DEFAULT_MAX_TURNS: usize = 25;
 
 /// 子代理角色。
 #[derive(Debug, Clone, Copy)]
@@ -63,6 +67,8 @@ pub enum OrchestratorEvent {
 pub struct ToolCallRecord {
     pub id: String,
     pub name: String,
+    /// 解析后的工具调用入参（R2-SRV-008：供 api/ws 回填 Session.messages 的 ToolCall.input）。
+    pub input: Value,
     pub result: ToolResult,
 }
 
@@ -71,7 +77,7 @@ pub struct Orchestrator {
     llm: Arc<dyn LlmClient>,
     sandbox: Arc<Sandbox>,
     tool_specs: Arc<Vec<ToolSpec>>,
-    prompt_engine: forgeclaw_core::prompt::PromptEngine,
+    prompt_engine: tokio::sync::Mutex<forgeclaw_core::prompt::PromptEngine>,
     working_dir: PathBuf,
     model: String,
     profile: String,
@@ -91,7 +97,9 @@ impl Orchestrator {
             llm,
             sandbox,
             tool_specs: Arc::new(tool_specs),
-            prompt_engine: forgeclaw_core::prompt::PromptEngine::new(prompts_root),
+            prompt_engine: tokio::sync::Mutex::new(forgeclaw_core::prompt::PromptEngine::new(
+                prompts_root,
+            )),
             working_dir,
             model,
             profile,
@@ -110,14 +118,16 @@ impl Orchestrator {
 
     /// 编译 system prompt（注入 tools/model/cwd 变量）。
     pub async fn compile_prompt(&self, profile: &str) -> anyhow::Result<String> {
+        let mut engine = self.prompt_engine.lock().await;
         let vars = self.prompt_vars();
-        let prompt = self.prompt_engine.compile(profile, &vars)?;
+        let prompt = engine.compile(profile, &vars)?;
         Ok(prompt)
     }
 
     /// 列出 profile 启用的 sections。
     pub async fn list_sections(&self, profile: &str) -> anyhow::Result<Vec<Section>> {
-        let sections = self.prompt_engine.list_sections(profile)?;
+        let engine = self.prompt_engine.lock().await;
+        let sections = engine.list_sections(profile)?;
         Ok(sections)
     }
 
@@ -136,8 +146,9 @@ impl Orchestrator {
     }
 
     async fn compile_system_prompt(&self) -> anyhow::Result<String> {
+        let mut engine = self.prompt_engine.lock().await;
         let vars = self.prompt_vars();
-        let prompt = self.prompt_engine.compile(&self.profile, &vars)?;
+        let prompt = engine.compile(&self.profile, &vars)?;
         Ok(prompt)
     }
 
@@ -157,7 +168,7 @@ impl Orchestrator {
             history,
             user_msg,
             None,
-            25,
+            DEFAULT_MAX_TURNS,
         )
         .await
     }
@@ -180,14 +191,14 @@ impl Orchestrator {
             history,
             user_msg,
             Some(&tx),
-            25,
+            DEFAULT_MAX_TURNS,
         )
         .await?;
         Ok(())
     }
 
-    /// 派发子代理：受限沙箱（只读工具）+ 角色 system prompt，跑最多 5 轮，
-    /// 仅返回最终 summary 文本（隔离上下文，省 token）。
+    /// 派发子代理：受限沙箱（只读工具）+ 角色 system prompt，跑一轮 run_turn
+    /// （内部已含完整工具循环），仅返回最终 summary 文本（隔离上下文，省 token）。
     pub async fn dispatch_subagent(
         &self,
         role: SubagentRole,
@@ -197,31 +208,38 @@ impl Orchestrator {
         let sandbox = Arc::new(sandbox);
         let system_prompt = subagent_system_prompt(role);
         let mut history = History::with_system(system_prompt);
-        let mut msg = task;
-        for _round in 0..5 {
-            match self
-                .run_turn(
-                    &sandbox,
-                    &tool_specs,
-                    &mut history,
-                    std::mem::take(&mut msg),
-                    None,
-                    25,
-                )
-                .await
-            {
-                Ok(OrchestratorEvent::Complete { text, .. }) => return Ok(text),
-                Ok(_) => continue,
-                Err(e) => return Err(e),
+        // R2-SRV-003：run_turn 内部已含完整工具循环，无需外层 for 循环；
+        // 旧实现 std::mem::take 清空 msg 后 continue 传空消息，已移除。
+        match self
+            .run_turn(
+                &sandbox,
+                &tool_specs,
+                &mut history,
+                task,
+                None,
+                DEFAULT_MAX_TURNS,
+            )
+            .await
+        {
+            Ok(OrchestratorEvent::Complete { text, .. }) => Ok(text),
+            Ok(OrchestratorEvent::Error { message }) => {
+                Err(anyhow::anyhow!("subagent error: {message}"))
             }
+            Err(e) => Err(e),
+            Ok(other) => Err(anyhow::anyhow!("subagent unexpected event: {other:?}")),
         }
-        Ok("subagent: rounds exhausted".to_string())
     }
 
     /// 核心单轮循环：append user → 反复 (LLM 调用 → 工具执行 → 回填) 直到无工具调用。
     ///
     /// `tx` 为 `Some` 时把流式事件推入 channel。`sandbox` / `tool_specs` 可被
-    /// 覆盖（子代理用受限集合）。`max_turns` 限制 LLM 调用次数，防止死循环烧 token。
+    /// 覆盖（子代理用受限集合）。`max_turns` 限制 LLM 调用轮数（SRV-004）。
+    ///
+    /// 行为约定：
+    /// - `Event::Error` 立即返回 `OrchestratorEvent::Error`，不构造 assistant_msg、不 append（SRV-005）。
+    /// - `tx.send` 失败（客户端断开）立即返回 Error 停止生成（SRV-012）。
+    /// - `parse_tool_input` 失败时构造错误 ToolResult 回填，不执行工具（SRV-019）。
+    /// - 空 `tool_call_id` 自动生成 `call_<uuid>`（SRV-020）。
     async fn run_turn(
         &self,
         sandbox: &Sandbox,
@@ -231,21 +249,27 @@ impl Orchestrator {
         tx: Option<&mpsc::Sender<OrchestratorEvent>>,
         max_turns: usize,
     ) -> anyhow::Result<OrchestratorEvent> {
-        history.append(ChatMessage::user(user_msg));
+        // R2-SRV-002：在 temp 副本上操作，错误路径直接 return 不写回，
+        // 保证 history 不残留半截 tool_calls 导致下次请求 400。
+        let mut temp = history.clone();
+        temp.append(ChatMessage::user(user_msg));
         let mut records: Vec<ToolCallRecord> = Vec::new();
 
-        async fn emit(
-            tx: &mpsc::Sender<OrchestratorEvent>,
-            event: OrchestratorEvent,
-        ) -> anyhow::Result<()> {
-            tx.send(event)
-                .await
-                .map_err(|_| anyhow::anyhow!("client disconnected"))
-        }
+        let mut turn = 0usize;
+        loop {
+            turn += 1;
+            if turn > max_turns {
+                let event = OrchestratorEvent::Error {
+                    message: "max turns exceeded".into(),
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(event.clone()).await;
+                }
+                return Ok(event);
+            }
 
-        for _turn in 0..max_turns {
             let req = ChatRequest::from_history(
-                history,
+                &temp,
                 &self.model,
                 Some(0.0),
                 None,
@@ -260,7 +284,11 @@ impl Orchestrator {
                     Event::Delta(s) => {
                         text.push_str(&s);
                         if let Some(tx) = tx {
-                            emit(tx, OrchestratorEvent::Delta { text: s }).await?;
+                            if tx.send(OrchestratorEvent::Delta { text: s }).await.is_err() {
+                                return Ok(OrchestratorEvent::Error {
+                                    message: "client disconnected".into(),
+                                });
+                            }
                         }
                     }
                     Event::ToolCallDelta {
@@ -281,22 +309,37 @@ impl Orchestrator {
                         }
                     }
                     Event::Done => {}
+                    // SRV-005：流内错误立即返回 Error，不构造 assistant_msg、不 append。
                     Event::Error(message) => {
                         warn!(%message, "llm stream error event");
                         let event = OrchestratorEvent::Error { message };
                         if let Some(tx) = tx {
-                            emit(tx, event.clone()).await?;
+                            let _ = tx.send(event.clone()).await;
                         }
                         return Ok(event);
                     }
                 }
             }
 
-            let mut assistant_msg = ChatMessage::assistant(&text);
-            if !tcs.is_empty() {
-                assistant_msg.tool_calls = Some(tcs.values().map(ToolCallDto::from).collect());
+            // SRV-020：空 tool_call_id 自动补全，保证 assistant_msg 与 tool_msg 引用一致。
+            for agg in tcs.values_mut() {
+                if agg.id.is_empty() {
+                    agg.id = format!("call_{}", Uuid::new_v4());
+                }
             }
-            history.append(assistant_msg);
+
+            let assistant_msg = if tcs.is_empty() {
+                ChatMessage::assistant(&text)
+            } else {
+                let dtos: Vec<ToolCallDto> = tcs.values().map(ToolCallDto::from).collect();
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: text.clone(),
+                    tool_calls: Some(dtos),
+                    tool_call_id: None,
+                }
+            };
+            temp.append(assistant_msg);
 
             if tcs.is_empty() {
                 let event = OrchestratorEvent::Complete {
@@ -304,65 +347,109 @@ impl Orchestrator {
                     tool_calls: records,
                 };
                 if let Some(tx) = tx {
-                    emit(tx, event.clone()).await?;
+                    if tx.send(event.clone()).await.is_err() {
+                        // 客户端断开：不 commit，history 保持原样（R2-SRV-002）。
+                        return Ok(OrchestratorEvent::Error {
+                            message: "client disconnected".into(),
+                        });
+                    }
                 }
+                // 成功完成：把 temp 写回 history（R2-SRV-002）。
+                *history = temp;
                 return Ok(event);
             }
 
             for agg in tcs.into_values() {
                 let parsed = parse_tool_input(&agg.arguments);
-                let input_for_start = parsed.as_ref().unwrap_or(&Value::Null).clone();
-                if let Some(tx) = tx {
-                    emit(
-                        tx,
-                        OrchestratorEvent::ToolCallStart {
-                            name: agg.name.clone(),
-                            input: input_for_start,
-                        },
-                    )
-                    .await?;
-                }
+                // R2-SRV-008：记录解析后的 input 供 ToolCallRecord 携带。
+                let input_value = match &parsed {
+                    Ok(v) => v.clone(),
+                    Err(_) => Value::Null,
+                };
+                // SRV-019：parse 失败时构造错误 ToolResult 回填，不执行工具。
                 let result = match parsed {
-                    Ok(input) => match sandbox.execute(&agg.name, input).await {
-                        Ok(r) => r,
-                        Err(e) => ToolResult {
+                    Ok(v) => {
+                        if let Some(tx) = tx {
+                            if tx
+                                .send(OrchestratorEvent::ToolCallStart {
+                                    name: agg.name.clone(),
+                                    input: v.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return Ok(OrchestratorEvent::Error {
+                                    message: "client disconnected".into(),
+                                });
+                            }
+                        }
+                        match sandbox.execute(&agg.name, v).await {
+                            Ok(r) => r,
+                            Err(e) => ToolResult {
+                                output: String::new(),
+                                error: Some(e.to_string()),
+                                duration_ms: 0,
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("invalid tool input: {e}");
+                        if let Some(tx) = tx {
+                            if tx
+                                .send(OrchestratorEvent::ToolCallStart {
+                                    name: agg.name.clone(),
+                                    input: Value::Null,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return Ok(OrchestratorEvent::Error {
+                                    message: "client disconnected".into(),
+                                });
+                            }
+                        }
+                        ToolResult {
                             output: String::new(),
-                            error: Some(e.to_string()),
+                            error: Some(err_msg),
                             duration_ms: 0,
-                        },
-                    },
-                    Err(result) => result,
+                        }
+                    }
                 };
                 if let Some(tx) = tx {
-                    emit(
-                        tx,
-                        OrchestratorEvent::ToolResult {
+                    if tx
+                        .send(OrchestratorEvent::ToolResult {
                             name: agg.name.clone(),
                             result: result.clone(),
-                        },
-                    )
-                    .await?;
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(OrchestratorEvent::Error {
+                            message: "client disconnected".into(),
+                        });
+                    }
                 }
                 records.push(ToolCallRecord {
                     id: agg.id.clone(),
                     name: agg.name.clone(),
+                    input: input_value,
                     result: result.clone(),
                 });
-                let tool_content = match &result.error {
-                    Some(e) => format!("error: {}", e),
-                    None => result.output,
+                // R2-SRV-001：合并 error 进 content，避免工具失败时 LLM 收到空内容。
+                let content = if let Some(e) = &result.error {
+                    format!("error: {}\n{}", e, result.output)
+                } else {
+                    result.output.clone()
                 };
-                history.append(ChatMessage::tool(tool_content, agg.id));
+                let tool_msg = ChatMessage {
+                    role: "tool".into(),
+                    content,
+                    tool_calls: None,
+                    tool_call_id: Some(agg.id),
+                };
+                temp.append(tool_msg);
             }
         }
-
-        let event = OrchestratorEvent::Error {
-            message: "max turns exceeded".into(),
-        };
-        if let Some(tx) = tx {
-            emit(tx, event.clone()).await?;
-        }
-        Ok(event)
     }
 }
 
@@ -386,15 +473,13 @@ impl From<&ToolCallAgg> for ToolCallDto {
     }
 }
 
-fn parse_tool_input(args: &str) -> Result<Value, ToolResult> {
+/// 解析工具调用 arguments JSON 字符串。空串视为空对象。
+/// 解析失败返回 `Err`，由 [`Orchestrator::run_turn`] 构造错误 ToolResult 回填（SRV-019）。
+fn parse_tool_input(args: &str) -> Result<Value, serde_json::Error> {
     if args.trim().is_empty() {
         return Ok(Value::Object(serde_json::Map::new()));
     }
-    serde_json::from_str(args).map_err(|e| ToolResult {
-        output: String::new(),
-        error: Some(format!("invalid arguments json: {} (args={})", e, args)),
-        duration_ms: 0,
-    })
+    serde_json::from_str(args)
 }
 
 fn subagent_system_prompt(role: SubagentRole) -> String {

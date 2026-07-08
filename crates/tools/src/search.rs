@@ -85,21 +85,27 @@ impl Tool for SearchTool {
                 });
             }
         };
-        let mut hits: Vec<String> = Vec::new();
-        for entry in WalkDir::new(&base).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy();
-            if re.is_match(&name) {
-                if let Ok(rel) = entry.path().strip_prefix(&base) {
-                    hits.push(rel.to_string_lossy().to_string());
+        // 同步文件系统遍历放入 spawn_blocking，避免阻塞 tokio runtime。
+        let hits = tokio::task::spawn_blocking(move || {
+            let mut hits: Vec<String> = Vec::new();
+            for entry in WalkDir::new(&base).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
                 }
-                if hits.len() >= max {
-                    break;
+                let name = entry.file_name().to_string_lossy();
+                if re.is_match(&name) {
+                    if let Ok(rel) = entry.path().strip_prefix(&base) {
+                        hits.push(rel.to_string_lossy().to_string());
+                    }
+                    if hits.len() >= max {
+                        break;
+                    }
                 }
             }
-        }
+            hits
+        })
+        .await
+        .unwrap_or_default();
         Ok(ToolResult {
             output: hits.join("\n"),
             error: None,
@@ -175,29 +181,35 @@ impl Tool for GrepTool {
                 .canonicalize()
                 .unwrap_or_else(|_| self.working_dir.clone())
         };
-        let mut hits: Vec<String> = Vec::new();
-        for entry in WalkDir::new(&base).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let rel = path.strip_prefix(&base).unwrap_or(path);
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for (i, line) in content.lines().enumerate() {
-                if re.is_match(line) {
-                    hits.push(format!("{}:{}:{}", rel.display(), i + 1, line));
-                    if hits.len() >= max {
-                        break;
+        // 同步文件系统遍历 + 文件读取放入 spawn_blocking，避免阻塞 tokio runtime。
+        let hits = tokio::task::spawn_blocking(move || {
+            let mut hits: Vec<String> = Vec::new();
+            for entry in WalkDir::new(&base).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let rel = path.strip_prefix(&base).unwrap_or(path);
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                for (i, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        hits.push(format!("{}:{}:{}", rel.display(), i + 1, line));
+                        if hits.len() >= max {
+                            break;
+                        }
                     }
                 }
+                if hits.len() >= max {
+                    break;
+                }
             }
-            if hits.len() >= max {
-                break;
-            }
-        }
+            hits
+        })
+        .await
+        .unwrap_or_default();
         Ok(ToolResult {
             output: hits.join("\n"),
             error: None,

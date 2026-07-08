@@ -1,64 +1,88 @@
+// 会话 store：维护会话列表 + 当前会话消息。
+//
+// 与 WS 解耦：ChatView 负责建立 WS 并把事件转成 Message 追加进 currentMessages；
+// 本 store 负责 REST 拉取列表/详情与切换当前会话。
+
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { api } from '../api/client'
-import type { SessionSummary, SessionDetail, Message } from '../api/types'
+
+import { getSession, listSessions } from '@/api/client'
+import type { Message, SessionSummary } from '@/api/types'
 
 export const useSessionStore = defineStore('session', () => {
   const sessions = ref<SessionSummary[]>([])
-  const currentSession = ref<SessionDetail | null>(null)
-  const messages = ref<Message[]>([])
+  const currentId = ref<string | null>(null)
+  const currentMessages = ref<Message[]>([])
   const loading = ref(false)
   const error = ref<string | null>(null)
 
-  async function fetchSessions() {
+  async function fetchSessions(token: string): Promise<void> {
     loading.value = true
     error.value = null
     try {
-      sessions.value = await api.get<SessionSummary[]>('/api/sessions')
-    } catch (err) {
-      error.value = err instanceof Error ? err.message : String(err)
+      sessions.value = await listSessions(token)
+    } catch (e) {
+      error.value = (e as Error).message
+      sessions.value = []
     } finally {
       loading.value = false
     }
   }
 
-  async function fetchSession(id: string) {
+  async function openSession(token: string, id: string): Promise<void> {
     loading.value = true
     error.value = null
     try {
-      const detail = await api.get<SessionDetail>(`/api/sessions/${id}`)
-      currentSession.value = detail
-      messages.value = detail.messages
-    } catch (err) {
-      error.value = err instanceof Error ? err.message : String(err)
+      const detail = await getSession(token, id)
+      currentId.value = id
+      currentMessages.value = detail.messages ?? []
+    } catch (e) {
+      error.value = (e as Error).message
     } finally {
       loading.value = false
     }
   }
 
-  function setMessages(msgs: Message[]) {
-    messages.value = msgs
+  /** 新建空白会话（尚未持久化到后端，首条消息发送时由后端分配 id）。 */
+  function newSession(): void {
+    currentId.value = null
+    currentMessages.value = []
+    error.value = null
   }
 
-  function appendMessage(msg: Message) {
-    messages.value.push(msg)
+  /** 由 ChatView 在收到 complete 帧后回写后端分配的 session_id。 */
+  function setCurrentId(id: string): void {
+    currentId.value = id
   }
 
-  function clearCurrent() {
-    currentSession.value = null
-    messages.value = []
+  function pushMessage(msg: Message): void {
+    currentMessages.value.push(msg)
+  }
+
+  /** 撤销最后一次 push（用于 WS 建立失败时清理用户消息和占位 assistant）。 */
+  function popMessage(): void {
+    currentMessages.value.pop()
+  }
+
+  function reset(): void {
+    sessions.value = []
+    currentId.value = null
+    currentMessages.value = []
+    error.value = null
   }
 
   return {
     sessions,
-    currentSession,
-    messages,
+    currentId,
+    currentMessages,
     loading,
     error,
     fetchSessions,
-    fetchSession,
-    setMessages,
-    appendMessage,
-    clearCurrent,
+    openSession,
+    newSession,
+    setCurrentId,
+    pushMessage,
+    popMessage,
+    reset,
   }
 })

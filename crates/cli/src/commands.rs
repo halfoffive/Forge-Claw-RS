@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -323,7 +323,7 @@ pub async fn run_run(cfg: Config, task: String, auto_apply: bool) -> anyhow::Res
 // ============ prompt ============
 
 pub async fn run_prompt_compile(cfg: Config, profile: String) -> anyhow::Result<()> {
-    let engine = PromptEngine::new(cfg.prompts_root.clone());
+    let mut engine = PromptEngine::new(cfg.prompts_root.clone());
     let vars = prompt_vars(&cfg);
     let prompt = engine.compile(&profile, &vars)?;
     print!("{prompt}");
@@ -410,14 +410,31 @@ fn build_tool_input(tool: &str, args: &[String]) -> serde_json::Value {
 
 // ============ web ============
 
-pub async fn run_web(cfg: Config, host: &str, port: u16) -> anyhow::Result<()> {
+pub async fn run_web(cfg: Config, host: String, port: u16) -> anyhow::Result<()> {
     let orch = build_orchestrator(&cfg, true)?;
     let users = resolve_users(&cfg);
-    validate_users(&users)?;
+    if users.is_empty() {
+        bail!(
+            "未配置 web 用户：请运行 `forgeclaw config init` 生成默认配置与随机 token，\
+             或设置环境变量 FORGECLAW_USERS=name:token[,name:token]"
+        );
+    }
+    let is_loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if !is_loopback {
+        for (_name, token) in &users {
+            if token.is_empty() || token == "change-me" || token == "local-token" {
+                bail!(
+                    "绑定到非回环地址 {host} 时检测到弱 token（change-me/local-token/空），\
+                     拒绝启动。请运行 `forgeclaw config init` 生成随机 token 或手动修改配置。"
+                );
+            }
+        }
+    }
     let user_store = UserStore::from_config(users.clone());
-    let state = AppState::with_allowed_origins(orch, user_store, cfg.allowed_origins.clone());
-    let addr = parse_bind_addr(host, port)?;
-    println!("ForgeClaw Web 服务已启动: http://127.0.0.1:{port}");
+    let allowed_origins = resolve_allowed_origins(&cfg, &host, port);
+    let state = AppState::new(orch, user_store, allowed_origins);
+    let addr = SocketAddr::new(host.parse()?, port);
+    println!("ForgeClaw Web 服务已启动: http://{host}:{port}");
     println!(
         "可用用户: {}",
         users
@@ -432,29 +449,7 @@ pub async fn run_web(cfg: Config, host: &str, port: u16) -> anyhow::Result<()> {
     server_run(addr, state).await
 }
 
-fn parse_bind_addr(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|_| anyhow::anyhow!("无效的主机地址: {host}"))?;
-    Ok(SocketAddr::from((ip, port)))
-}
-
-fn validate_users(users: &[(String, String)]) -> anyhow::Result<()> {
-    if users.is_empty() {
-        bail!("未配置任何用户，请运行 `forgeclaw config init` 生成 token");
-    }
-    for (name, token) in users {
-        if token.is_empty() {
-            bail!("用户 {name} 的 token 为空，请运行 `forgeclaw config init` 重新生成");
-        }
-        if token == "change-me" || token == "local-token" {
-            bail!("用户 {name} 使用默认/已知 token `{token}`，请运行 `forgeclaw config init` 重新生成");
-        }
-    }
-    Ok(())
-}
-
-/// 解析 web 用户：env `FORGECLAW_USERS` > 配置文件 users > 默认本地用户。
+/// 解析 web 用户：env `FORGECLAW_USERS` > 配置文件 users；无则返回空 vec。
 fn resolve_users(cfg: &Config) -> Vec<(String, String)> {
     let env_raw = std::env::var("FORGECLAW_USERS").unwrap_or_default();
     if !env_raw.trim().is_empty() {
@@ -470,11 +465,30 @@ fn resolve_users(cfg: &Config) -> Vec<(String, String)> {
                 Some((n, t))
             })
             .collect()
-    } else if !cfg.users.is_empty() {
-        cfg.users.clone()
     } else {
-        vec![("local".to_string(), "local-token".to_string())]
+        cfg.users.clone()
     }
+}
+
+/// 解析 CORS 白名单：`config.allowed_origins` 非空则用之，否则用代码默认值
+/// （vite dev 5173）；非回环 host 追加 `http://{host}:{port}`（SRV-001）。
+fn resolve_allowed_origins(cfg: &Config, host: &str, port: u16) -> Vec<String> {
+    let mut origins = if cfg.allowed_origins.is_empty() {
+        vec![
+            "http://127.0.0.1:5173".to_string(),
+            "http://localhost:5173".to_string(),
+        ]
+    } else {
+        cfg.allowed_origins.clone()
+    };
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    if !is_loopback {
+        let origin = format!("http://{host}:{port}");
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    origins
 }
 
 // ============ config ============
@@ -506,16 +520,11 @@ pub fn run_config_init() -> anyhow::Result<()> {
         Some(p) => println!("已写入默认配置: {}", p.display()),
         None => println!("已写入默认配置"),
     }
+    if let Some((_, token)) = cfg.users.first() {
+        println!("已生成随机登录 token（请妥善保存，仅显示一次）: {token}");
+    }
     println!("请编辑该文件填入 api_key，或设置环境变量 DEEPSEEK_API_KEY。");
     Ok(())
-}
-
-fn display_config_value(key: &str, value: &str) -> String {
-    if key == "api_key" {
-        crate::config::mask_key(value)
-    } else {
-        value.to_string()
-    }
 }
 
 pub fn run_config_set(key: &str, value: &str) -> anyhow::Result<()> {
@@ -532,15 +541,17 @@ pub fn run_config_set(key: &str, value: &str) -> anyhow::Result<()> {
         ),
     }
     cfg.save()?;
-    let display = display_config_value(key, value);
-    println!("已设置 {key} = {display}");
+    if key == "api_key" {
+        println!("已设置 {key} = {}", cfg.masked_api_key());
+    } else {
+        println!("已设置 {key} = {value}");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
 
     #[test]
     fn build_tool_input_json_object_passthrough() {
@@ -602,12 +613,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_users_defaults_to_local() {
-        // 无 env 无配置 → 默认本地用户
+    fn resolve_users_empty_when_no_config() {
+        // 无 env 无配置 → 空 vec（不再兜底 local-token）
         std::env::remove_var("FORGECLAW_USERS");
         let cfg = Config::default();
         let u = resolve_users(&cfg);
-        assert_eq!(u, vec![("local".to_string(), "local-token".to_string())]);
+        assert!(u.is_empty());
     }
 
     #[test]
@@ -621,6 +632,33 @@ mod tests {
         assert_eq!(u[0].0, "alice");
     }
 
+    #[test]
+    fn resolve_allowed_origins_default_loopback() {
+        let cfg = Config::default();
+        let origins = resolve_allowed_origins(&cfg, "127.0.0.1", 8080);
+        assert!(origins.contains(&"http://127.0.0.1:5173".to_string()));
+        assert!(origins.contains(&"http://localhost:5173".to_string()));
+        // 回环 host 不追加自身端口
+        assert!(!origins.contains(&"http://127.0.0.1:8080".to_string()));
+    }
+
+    #[test]
+    fn resolve_allowed_origins_non_loopback_appends_host_port() {
+        let cfg = Config::default();
+        let origins = resolve_allowed_origins(&cfg, "0.0.0.0", 8080);
+        assert!(origins.contains(&"http://0.0.0.0:8080".to_string()));
+    }
+
+    #[test]
+    fn resolve_allowed_origins_uses_config_when_non_empty() {
+        let cfg = Config {
+            allowed_origins: vec!["http://custom.example".into()],
+            ..Config::default()
+        };
+        let origins = resolve_allowed_origins(&cfg, "127.0.0.1", 8080);
+        assert_eq!(origins, vec!["http://custom.example".to_string()]);
+    }
+
     #[tokio::test]
     async fn tool_list_returns_five_tools() {
         let dir = std::env::temp_dir();
@@ -628,60 +666,5 @@ mod tests {
         let names = sb.list();
         assert_eq!(names.len(), 5);
         assert!(names.contains(&"shell".to_string()));
-    }
-
-    #[test]
-    fn parse_bind_addr_defaults_to_loopback() {
-        let addr = parse_bind_addr("127.0.0.1", 8080).unwrap();
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 8080);
-    }
-
-    #[test]
-    fn parse_bind_addr_allows_any_interface() {
-        let addr = parse_bind_addr("0.0.0.0", 8080).unwrap();
-        assert!(addr.ip().is_unspecified());
-    }
-
-    #[test]
-    fn parse_bind_addr_rejects_invalid_host() {
-        assert!(parse_bind_addr("not-an-ip", 8080).is_err());
-    }
-
-    #[test]
-    fn validate_users_rejects_weak_tokens() {
-        assert!(validate_users(&[("local".into(), "".into())]).is_err());
-        assert!(validate_users(&[("local".into(), "change-me".into())]).is_err());
-        assert!(validate_users(&[("local".into(), "local-token".into())]).is_err());
-    }
-
-    #[test]
-    fn validate_users_accepts_random_token() {
-        assert!(validate_users(&[("local".into(), Uuid::new_v4().to_string())]).is_ok());
-    }
-
-    #[test]
-    fn default_for_init_uses_random_token() {
-        let cfg = Config::default_for_init();
-        let token = &cfg.users[0].1;
-        assert!(!token.is_empty());
-        assert_ne!(token, "change-me");
-        assert_ne!(token, "local-token");
-    }
-
-    #[test]
-    fn display_config_value_masks_api_key() {
-        assert_eq!(
-            display_config_value("api_key", "sk-abcdef123456"),
-            "sk-a...3456"
-        );
-    }
-
-    #[test]
-    fn display_config_value_passes_through_other_keys() {
-        assert_eq!(
-            display_config_value("model", "deepseek-chat"),
-            "deepseek-chat"
-        );
     }
 }

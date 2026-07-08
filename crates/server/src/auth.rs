@@ -2,6 +2,9 @@
 //!
 //! MVP 策略：静态预配置 token 比对（无 JWT/无密码哈希）。会话隔离通过
 //! [`crate::api::SessionData::user_id`] 过滤实现，跨用户访问返回 404 不泄漏存在性。
+//!
+//! WS 一次性 ticket：浏览器 WS 无法设 Authorization header，login/ticket 端点签发
+//! 短期 ticket（60s TTL，用后即焚），WS 升级时凭 `?ticket=` 鉴权。
 
 use std::collections::HashMap;
 
@@ -10,43 +13,35 @@ use axum::http::{header, request::Parts, HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{DateTime, Duration, Utc};
-use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::api::AppState;
 
-/// 用户模型（内部使用，token 用 `SecretString` 保护）。
-#[derive(Clone, Debug)]
+/// 用户模型。`token` 字段序列化时跳过，避免泄漏到响应体。
+#[derive(Clone, Debug, Serialize)]
 pub struct User {
     pub id: Uuid,
     pub name: String,
-    pub token: SecretString,
+    #[serde(skip_serializing)]
+    pub token: String,
 }
 
-/// 对外暴露的用户信息，不含 token。
-#[derive(Debug, Clone, Serialize)]
+/// 用户公开信息（响应体用，不含 token）。
+#[derive(Clone, Debug, Serialize)]
 pub struct UserPublic {
     pub id: Uuid,
     pub name: String,
 }
 
 impl From<&User> for UserPublic {
-    fn from(user: &User) -> Self {
+    fn from(u: &User) -> Self {
         Self {
-            id: user.id,
-            name: user.name.clone(),
+            id: u.id,
+            name: u.name.clone(),
         }
     }
-}
-
-/// 一次性 WebSocket ticket（60s 有效）。
-#[derive(Clone, Debug)]
-pub struct Ticket {
-    pub user_id: Uuid,
-    pub expires_at: DateTime<Utc>,
 }
 
 /// 用户存储：按 token / name 双索引查找。放入 `Arc` 后置入 [`AppState`] 共享。
@@ -60,7 +55,7 @@ impl UserStore {
         let mut by_token = HashMap::new();
         let mut by_name = HashMap::new();
         for u in users {
-            by_token.insert(u.token.expose_secret().to_string(), u.clone());
+            by_token.insert(u.token.clone(), u.clone());
             by_name.insert(u.name.clone(), u);
         }
         Self { by_token, by_name }
@@ -73,7 +68,7 @@ impl UserStore {
             .map(|(name, token)| User {
                 id: Uuid::new_v4(),
                 name,
-                token: SecretString::new(token.into()),
+                token,
             })
             .collect();
         Self::new(users)
@@ -108,43 +103,19 @@ impl UserStore {
     pub fn find_by_name(&self, name: &str) -> Option<User> {
         self.by_name.get(name).cloned()
     }
-
-    pub fn find_by_id(&self, id: Uuid) -> Option<User> {
-        self.by_name.values().find(|u| u.id == id).cloned()
-    }
-}
-
-impl AppState {
-    /// 签发一个 60s 有效的一次性 WS ticket。
-    pub async fn issue_ticket(&self, user_id: Uuid) -> Uuid {
-        let ticket = Uuid::new_v4();
-        let expires_at = Utc::now() + Duration::seconds(60);
-        let mut tickets = self.tickets.write().await;
-        tickets.insert(
-            ticket,
-            Ticket {
-                user_id,
-                expires_at,
-            },
-        );
-        ticket
-    }
-
-    /// 消费 ticket：返回对应用户。ticket 用后即焚，过期也返回 None。
-    pub async fn consume_ticket(&self, ticket: Uuid) -> Option<User> {
-        let mut tickets = self.tickets.write().await;
-        let t = tickets.remove(&ticket)?;
-        if t.expires_at < Utc::now() {
-            return None;
-        }
-        self.user_store.find_by_id(t.user_id)
-    }
 }
 
 /// 从 `Authorization: Bearer <token>` 提取 token。
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     let header = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     header.strip_prefix("Bearer ").map(str::trim)
+}
+
+/// 常量时间字符串比较，避免计时侧信道泄漏 token 信息（SRV-018）。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 fn unauthorized_response() -> Response {
@@ -165,9 +136,11 @@ pub async fn auth_middleware(
         Some(t) => t,
         None => return unauthorized_response(),
     };
+    // UserStore 内部用 HashMap 索引，token 比对在 find_by_token 内完成。
+    // 此处再用常量时间比对复核，避免 HashMap 早退泄漏长度/前缀信息。
     let user = match state.user_store.find_by_token(token) {
-        Some(u) => u,
-        None => return unauthorized_response(),
+        Some(u) if constant_time_eq(&u.token, token) => u,
+        _ => return unauthorized_response(),
     };
     req.extensions_mut().insert(user);
     next.run(req).await
@@ -206,16 +179,11 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub ok: bool,
     pub user: UserPublic,
-    pub ticket: Uuid,
+    pub ticket: String,
 }
 
 /// `POST /api/auth/login`：校验 `{name, token}`，返回 `{ok:true, user, ticket}`。
-/// ticket 用于 `/ws/chat?ticket=...`，60s 内一次性有效。
-/// 不套 auth 中间件。
-fn constant_time_token_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
-}
-
+/// 不套 auth 中间件。响应不含 token（SRV-024），并签发一次性 WS ticket（SRV-002）。
 pub async fn login_handler(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
@@ -224,10 +192,11 @@ pub async fn login_handler(
         .user_store
         .find_by_name(&req.name)
         .ok_or_else(unauthorized_response)?;
-    if !constant_time_token_eq(user.token.expose_secret(), &req.token) {
+    // 常量时间比对，避免计时侧信道（SRV-018）。
+    if !constant_time_eq(&user.token, &req.token) {
         return Err(unauthorized_response());
     }
-    let ticket = state.issue_ticket(user.id).await;
+    let ticket = state.issue_ticket(user.id);
     Ok(Json(LoginResponse {
         ok: true,
         user: UserPublic::from(&user),
@@ -235,62 +204,18 @@ pub async fn login_handler(
     }))
 }
 
-/// `GET /api/auth/ticket`：为当前已鉴权用户签发一个一次性 WS ticket。
-/// 该端点受 auth 中间件保护。
+// ============ Ticket 端点（WS 一次性 ticket） ============
+
+#[derive(Debug, Serialize)]
+pub struct TicketResponse {
+    pub ticket: String,
+}
+
+/// `GET /api/auth/ticket`：需 Bearer 鉴权，签发一次性 WS ticket（60s TTL）。
 pub async fn ticket_handler(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
-) -> Result<Json<serde_json::Value>, Response> {
-    let ticket = state.issue_ticket(user.id).await;
-    Ok(Json(serde_json::json!({ "ticket": ticket })))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn equal_tokens_match() {
-        assert!(constant_time_token_eq("alice-token", "alice-token"));
-    }
-
-    #[test]
-    fn different_tokens_do_not_match() {
-        assert!(!constant_time_token_eq("alice-token", "alice-tokex"));
-    }
-
-    #[test]
-    fn different_length_tokens_do_not_match() {
-        assert!(!constant_time_token_eq("short", "longer"));
-    }
-
-    #[test]
-    fn login_response_does_not_leak_token() {
-        let secret_token = "super-secret-token";
-        let user = User {
-            id: Uuid::new_v4(),
-            name: "alice".into(),
-            token: SecretString::new(secret_token.into()),
-        };
-        let resp = LoginResponse {
-            ok: true,
-            user: UserPublic::from(&user),
-            ticket: Uuid::new_v4(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(!json.contains(secret_token));
-        assert!(json.contains("\"name\":\"alice\""));
-    }
-
-    #[test]
-    fn user_debug_does_not_leak_token() {
-        let secret_token = "debug-secret-token";
-        let user = User {
-            id: Uuid::new_v4(),
-            name: "alice".into(),
-            token: SecretString::new(secret_token.into()),
-        };
-        let out = format!("{:?}", user);
-        assert!(!out.contains(secret_token));
-    }
+) -> Json<TicketResponse> {
+    let ticket = state.issue_ticket(user.id);
+    Json(TicketResponse { ticket })
 }

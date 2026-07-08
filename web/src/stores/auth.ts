@@ -1,49 +1,49 @@
+// 鉴权 store：持久化 token/user 到 localStorage，提供 login/logout。
+//
+// 注意：后端 `/api/auth/login` 当前响应不含 ticket 字段（与任务契约略有出入），
+// 这里仍按契约保留 ticket 字段读取（可选），实际 WS 连接走 getWsTicket() 重新换取。
+
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { api, setToken, getToken } from '../api/client'
-import type { LoginRequest, User } from '../api/types'
+
+import { ApiError, login as apiLogin } from '@/api/client'
+import type { User } from '@/api/types'
+
+const TOKEN_KEY = 'forgeclaw.token'
+const USER_KEY = 'forgeclaw.user'
+
+function readUser(): User | null {
+  try {
+    const raw = localStorage.getItem(USER_KEY)
+    return raw ? (JSON.parse(raw) as User) : null
+  } catch {
+    return null
+  }
+}
 
 export const useAuthStore = defineStore('auth', () => {
-  const token = ref<string | null>(getToken())
-  const user = ref<User | null>(null)
-  const loading = ref(false)
-  const error = ref<string | null>(null)
+  const token = ref<string>(localStorage.getItem(TOKEN_KEY) ?? '')
+  const user = ref<User | null>(readUser())
 
-  const isLoggedIn = computed(() => !!token.value)
+  const isLoggedIn = computed(() => Boolean(token.value && user.value))
 
-  async function login(credentials: LoginRequest) {
-    loading.value = true
-    error.value = null
-    try {
-      const res = await api.post<{ ok: boolean; user: User; ticket: string }>('/api/auth/login', credentials)
-      if (!res.ok || !res.user) {
-        throw new Error('Login failed')
-      }
-      user.value = res.user
-      token.value = credentials.token
-      setToken(credentials.token)
-      return true
-    } catch (err) {
-      error.value = err instanceof Error ? err.message : String(err)
-      return false
-    } finally {
-      loading.value = false
+  async function login(name: string, rawToken: string): Promise<void> {
+    const res = await apiLogin(name, rawToken)
+    if (!res.ok || !res.user) {
+      throw new ApiError(401, '登录失败：凭据无效')
     }
+    token.value = rawToken
+    user.value = { id: res.user.id, name: res.user.name }
+    localStorage.setItem(TOKEN_KEY, rawToken)
+    localStorage.setItem(USER_KEY, JSON.stringify(user.value))
   }
 
-  function logout() {
+  function logout(): void {
+    token.value = ''
     user.value = null
-    token.value = null
-    setToken(null)
+    localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(USER_KEY)
   }
 
-  return {
-    token,
-    user,
-    loading,
-    error,
-    isLoggedIn,
-    login,
-    logout,
-  }
+  return { token, user, isLoggedIn, login, logout }
 })

@@ -51,7 +51,14 @@ fn build_state() -> (AppState, tempfile::TempDir) {
         dir.path().to_path_buf(),
     );
     let user_store = UserStore::from_config(vec![("alice".into(), TEST_TOKEN.into())]);
-    (AppState::new(Arc::new(orch), user_store), dir)
+    (
+        AppState::new(
+            Arc::new(orch),
+            user_store,
+            vec!["http://localhost:5173".to_string()],
+        ),
+        dir,
+    )
 }
 
 /// 返回 LLM Error 事件的 Mock 客户端，用于验证 500 响应体被统一。

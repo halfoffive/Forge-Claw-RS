@@ -13,4 +13,3 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-tracing = { workspace = true }
