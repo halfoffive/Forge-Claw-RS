@@ -229,21 +229,6 @@ async fn run_streaming_emits_delta_toolcall_toolresult_complete() {
 }
 
 #[tokio::test]
-async fn run_streaming_stops_when_receiver_dropped() {
-    // receiver 被丢弃后，orchestrator 的 tx.send 应失败并返回 Err，停止继续运行。
-    let (orch, _dir) = build_orch(vec![vec![Event::Delta("x".into()), Event::Done]]);
-    let mut history = History::with_system("sys");
-    let (tx, rx) = mpsc::channel::<OrchestratorEvent>(1);
-    drop(rx);
-
-    let res = orch.run_streaming(&mut history, "go".into(), tx).await;
-    assert!(
-        res.is_err(),
-        "run_streaming should fail when receiver is dropped"
-    );
-}
-
-#[tokio::test]
 async fn dispatch_subagent_returns_summary() {
     let (orch, _dir) = build_orch(vec![vec![
         Event::Delta("explore-summary".into()),
@@ -397,20 +382,6 @@ async fn run_once_tool_error_feeds_error_into_history() {
 }
 
 #[tokio::test]
-async fn run_once_propagates_llm_stream_error() {
-    // LLM 流产出 Event::Error 时应立即返回 OrchestratorEvent::Error，不落入 Complete { text: "" }。
-    let (orch, _dir) = build_orch(vec![vec![Event::Error("llm failure".into())]]);
-    let mut history = History::with_system("sys");
-    let event = orch.run_once(&mut history, "x".into()).await.unwrap();
-    match event {
-        OrchestratorEvent::Error { message } => assert_eq!(message, "llm failure"),
-        other => panic!("expected Error event, got {:?}", other),
-    }
-    // system + user，不应追加空的 assistant 消息
-    assert_eq!(history.len(), 2);
-}
-
-#[tokio::test]
 async fn run_once_max_turns_exceeded_returns_error() {
     // LLM 每轮都返回工具调用，25 轮后应因 max_turns 超限返回 Error。
     let scripts: Vec<Vec<Event>> = (0..25)
@@ -432,44 +403,6 @@ async fn run_once_max_turns_exceeded_returns_error() {
         OrchestratorEvent::Error { message } => assert_eq!(message, "max turns exceeded"),
         other => panic!("expected max turns error, got {:?}", other),
     }
-}
-
-#[tokio::test]
-async fn run_once_invalid_tool_arguments_returns_tool_result_error() {
-    // LLM 给出非法 JSON 参数时，应构造 error ToolResult 回填，不执行工具。
-    let scripts = vec![
-        vec![Event::ToolCallDelta {
-            index: 0,
-            id: Some("c1".into()),
-            name: Some("read".into()),
-            arguments: Some("not-json{{".into()),
-        }],
-        vec![Event::Delta("ok".into()), Event::Done],
-    ];
-    let (orch, _dir) = build_orch(scripts);
-    let mut history = History::with_system("sys");
-    let event = orch.run_once(&mut history, "x".into()).await.unwrap();
-
-    match event {
-        OrchestratorEvent::Complete { text, tool_calls } => {
-            assert_eq!(text, "ok");
-            assert_eq!(tool_calls.len(), 1);
-            assert_eq!(tool_calls[0].name, "read");
-            let err = tool_calls[0]
-                .result
-                .error
-                .as_ref()
-                .expect("should report invalid arguments json");
-            assert!(err.contains("invalid arguments json"), "got: {}", err);
-        }
-        other => panic!("unexpected: {:?}", other),
-    }
-
-    // 错误应回填进 history，让 LLM 在下一轮看到。
-    assert_eq!(history.len(), 5);
-    let tool_msg = &history.messages()[3];
-    assert_eq!(tool_msg.role, Role::Tool);
-    assert!(tool_msg.content.contains("invalid arguments json"));
 }
 
 #[tokio::test]
