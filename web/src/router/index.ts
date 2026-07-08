@@ -31,6 +31,12 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      path: '/prompts',
+      name: 'prompts',
+      component: () => import('@/views/PromptsView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
       path: '/settings',
       name: 'settings',
       component: () => import('@/views/SettingsView.vue'),

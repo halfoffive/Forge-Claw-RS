@@ -89,7 +89,14 @@ fn build_state_with_error_client() -> (AppState, tempfile::TempDir) {
         dir.path().to_path_buf(),
     );
     let user_store = UserStore::from_config(vec![("alice".into(), TEST_TOKEN.into())]);
-    (AppState::new(Arc::new(orch), user_store), dir)
+    (
+        AppState::new(
+            Arc::new(orch),
+            user_store,
+            vec!["http://localhost:5173".to_string()],
+        ),
+        dir,
+    )
 }
 
 async fn body_to_json(body: Body) -> Value {
@@ -225,7 +232,11 @@ async fn parallel_chat_requests_same_session_preserve_history() {
         sessions.insert(
             session_id,
             SessionData {
-                session: Session::new(session_id),
+                session: Session {
+                    id: session_id,
+                    created_at: chrono::Utc::now(),
+                    messages: Vec::new(),
+                },
                 history: Arc::new(RwLock::new(History::new())),
                 user_id: user.id,
             },

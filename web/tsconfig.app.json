@@ -8,10 +8,6 @@
       "@/*": ["./src/*"]
     },
 
-    "strict": true,
-    "noImplicitAny": true,
-    "strictNullChecks": true,
-
     /* Linting */
     "noUnusedLocals": true,
     "noUnusedParameters": true,

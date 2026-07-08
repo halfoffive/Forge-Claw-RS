@@ -30,7 +30,7 @@ futures = "0.3"
 # Web 服务
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "cors", "compression-full", "timeout", "limit"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "compression-full", "timeout"] }
 
 # HTTP 客户端
 # 注：reqwest 0.13 移除了 `rustls-tls` feature，等价为 `rustls`（含 aws-lc-rs provider）
@@ -59,6 +59,3 @@ rustyline = "18"
 
 # 嵌入资源（为 Task 7 预留）
 rust-embed = "8"
-
-# 敏感值保护
-secrecy = { version = "0.10", features = ["serde"] }
