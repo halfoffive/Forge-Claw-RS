@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use forgeclaw_llm::{ChatRequest, Event, History, LlmClient};
+use forgeclaw_llm::{ChatRequest, Event, History, LlmClient, Role};
 use forgeclaw_server::{
     default_sandbox_with_specs, restricted_sandbox_with_specs, Orchestrator, OrchestratorEvent,
     SubagentRole,
@@ -76,8 +76,8 @@ async fn run_once_completes_without_tool_calls() {
     }
     // system + user + assistant = 3
     assert_eq!(history.len(), 3);
-    assert_eq!(history.messages()[1].role, "user");
-    assert_eq!(history.messages()[2].role, "assistant");
+    assert_eq!(history.messages()[1].role, Role::User);
+    assert_eq!(history.messages()[2].role, Role::Assistant);
 }
 
 #[tokio::test]
@@ -111,18 +111,20 @@ async fn run_once_executes_tool_calls_and_loops() {
             assert_eq!(tool_calls[0].id, "call_1");
             assert_eq!(tool_calls[0].result.output, "hello-content");
             assert!(tool_calls[0].result.error.is_none());
+            // R2-SRV-008：ToolCallRecord.input 携带解析后的入参。
+            assert_eq!(tool_calls[0].input, serde_json::json!({"path":"a.txt"}));
         }
         other => panic!("unexpected event: {:?}", other),
     }
     // system + user + assistant(tool_calls) + tool + assistant("done") = 5
     assert_eq!(history.len(), 5);
     let assistant = &history.messages()[2];
-    assert_eq!(assistant.role, "assistant");
+    assert_eq!(assistant.role, Role::Assistant);
     let tcs = assistant.tool_calls.as_ref().expect("tool_calls present");
     assert_eq!(tcs.len(), 1);
     assert_eq!(tcs[0].function.name, "read");
     let tool_msg = &history.messages()[3];
-    assert_eq!(tool_msg.role, "tool");
+    assert_eq!(tool_msg.role, Role::Tool);
     assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_1"));
     assert_eq!(tool_msg.content, "hello-content");
 }
@@ -312,6 +314,43 @@ async fn run_once_tool_error_does_not_abort_turn() {
         }
         other => panic!("unexpected: {:?}", other),
     }
+    // R2-SRV-001：工具失败时 error 合并进 tool 消息 content，LLM 能看到错误而非空内容。
+    // history 布局：system(0) + user(1) + assistant(2,tool_calls) + tool(3) + assistant(4,"recovered")
+    let tool_msg = &history.messages()[3];
+    assert_eq!(tool_msg.role, Role::Tool);
+    assert!(
+        tool_msg.content.starts_with("error:"),
+        "tool content should embed error, got: {}",
+        tool_msg.content
+    );
+}
+
+#[tokio::test]
+async fn run_once_llm_error_does_not_modify_history() {
+    // R2-SRV-002：LLM 第二轮返回 Error，history 不应残留半截 tool_calls 导致下次 400。
+    // 第一轮：LLM 要求调用 read（assistant + tool 消息进入 temp）
+    // 第二轮：LLM 流内 Error → run_turn 提前返回 Error，temp 不写回 history。
+    let scripts = vec![
+        vec![Event::ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("read".into()),
+            arguments: Some("{\"path\":\"a.txt\"}".into()),
+        }],
+        vec![Event::Error("boom".into())],
+    ];
+    let (orch, dir) = build_orch(scripts);
+    std::fs::write(dir.path().join("a.txt"), "content").unwrap();
+
+    let mut history = History::with_system("sys");
+    let event = orch.run_once(&mut history, "x".into()).await.unwrap();
+    assert!(
+        matches!(event, OrchestratorEvent::Error { .. }),
+        "expected Error event, got {:?}",
+        event
+    );
+    // history 仅含 system（user/assistant/tool 均在 temp 中，错误路径不写回）。
+    assert_eq!(history.len(), 1);
 }
 
 #[tokio::test]

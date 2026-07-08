@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// CLI 运行配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,10 @@ pub struct Config {
     /// `(name, token)` 用户对，供 `web` 子命令构造 UserStore。
     #[serde(default)]
     pub users: Vec<(String, String)>,
+
+    /// Web CORS 白名单。空 vec 时 `web` 子命令用代码默认值（SRV-001）。
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_base_url() -> String {
@@ -66,6 +71,7 @@ impl Default for Config {
             working_dir: default_working_dir(),
             profile: default_profile(),
             users: Vec::new(),
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -83,10 +89,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// `config init` 用的默认模板（带一个示例本地用户）。
+    /// `config init` 用的默认模板（带一个示例本地用户，随机 token）。
     pub fn default_for_init() -> Self {
         Self {
-            users: vec![("local".to_string(), "change-me".to_string())],
+            users: vec![("local".to_string(), Uuid::new_v4().to_string())],
             ..Self::default()
         }
     }
@@ -99,6 +105,11 @@ impl Config {
         }
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -121,12 +132,12 @@ pub(crate) fn load_file_or_defaults() -> Config {
     cfg
 }
 
-/// `~/.forgeclaw/config.toml` 路径（无 HOME 返回 None）。
+/// `~/.forgeclaw/config.toml` 路径（HOME → USERPROFILE 回退，皆无返回 None）。
 pub(crate) fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    if home.is_empty() {
-        return None;
-    }
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
     Some(PathBuf::from(home).join(".forgeclaw").join("config.toml"))
 }
 
@@ -164,6 +175,7 @@ mod tests {
         assert_eq!(c.working_dir, PathBuf::from("."));
         assert!(c.api_key.is_empty());
         assert!(c.users.is_empty());
+        assert!(c.allowed_origins.is_empty());
     }
 
     #[test]
@@ -183,6 +195,7 @@ mod tests {
             working_dir: PathBuf::from("/tmp/w"),
             profile: "default".into(),
             users: vec![("alice".into(), "tok1".into())],
+            allowed_origins: vec!["http://example.com".into()],
         };
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
@@ -190,15 +203,20 @@ mod tests {
         assert_eq!(parsed.model, "m1");
         assert_eq!(parsed.working_dir, PathBuf::from("/tmp/w"));
         assert_eq!(parsed.users, vec![("alice".into(), "tok1".into())]);
+        assert_eq!(
+            parsed.allowed_origins,
+            vec!["http://example.com".to_string()]
+        );
     }
 
     #[test]
     fn partial_file_uses_serde_defaults() {
-        // 只给 api_key，其余字段走 serde default 函数；users 不写则为空 vec。
+        // 只给 api_key，其余字段走 serde default 函数；users/allowed_origins 不写则为空 vec。
         let parsed: Config = toml::from_str(r#"api_key = "k""#).unwrap();
         assert_eq!(parsed.api_key, "k");
         assert_eq!(parsed.model, "deepseek-chat");
         assert_eq!(parsed.base_url, "https://api.deepseek.com/v1");
         assert!(parsed.users.is_empty());
+        assert!(parsed.allowed_origins.is_empty());
     }
 }

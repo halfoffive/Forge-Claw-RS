@@ -48,7 +48,14 @@ fn build_state() -> (AppState, tempfile::TempDir) {
         dir.path().to_path_buf(),
     );
     let user_store = UserStore::from_config(vec![("alice".into(), TEST_TOKEN.into())]);
-    (AppState::new(Arc::new(orch), user_store), dir)
+    (
+        AppState::new(
+            Arc::new(orch),
+            user_store,
+            vec!["http://localhost:5173".to_string()],
+        ),
+        dir,
+    )
 }
 
 async fn body_to_json(body: Body) -> Value {

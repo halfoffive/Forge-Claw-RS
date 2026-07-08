@@ -5,9 +5,13 @@
 //!
 //! 会话隔离：每个 [`SessionData`] 绑定 `user_id`，`list_sessions`/`get_session`/
 //! `chat_handler` 按当前 [`crate::auth::AuthUser`] 过滤，跨用户访问返回 404 不泄漏存在性。
+//!
+//! WS 一次性 ticket：[`AppState`] 维护 `tickets` 表（`Mutex<HashMap>`），由
+//! `issue_ticket`/`consume_ticket` 签发与核销（60s TTL，用后即焚）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -23,30 +27,75 @@ use forgeclaw_llm::{History, ToolSpec};
 use crate::auth::{AuthUser, UserStore};
 use crate::orchestrator::{Orchestrator, OrchestratorEvent, ToolCallRecord};
 
+/// WS ticket TTL：签发后 60s 内有效。
+const TICKET_TTL: Duration = Duration::from_secs(60);
+
 /// 共享应用状态。`Clone` 廉价（仅 `Arc` 引用计数）。
 #[derive(Clone)]
 pub struct AppState {
     pub orchestrator: Arc<Orchestrator>,
     pub sessions: Arc<RwLock<HashMap<Uuid, SessionData>>>,
     pub user_store: Arc<UserStore>,
+    /// CORS 白名单（SRV-001）。
+    pub allowed_origins: Vec<String>,
+    /// WS 一次性 ticket 表：`ticket -> (user_id, issued_at)`（SRV-002）。
+    pub tickets: Arc<std::sync::Mutex<HashMap<String, (Uuid, Instant)>>>,
 }
 
 /// 单会话数据：核心 Session（含展示用 messages）+ LLM History（cache-first 前缀）+ 所属用户。
+///
+/// `history` 用 `Arc<RwLock<History>>` 共享，`chat_handler` 持写锁跑 LLM 防丢失更新（SRV-007）。
 #[derive(Clone)]
 pub struct SessionData {
     pub session: Session,
-    pub history: History,
+    pub history: Arc<RwLock<History>>,
     pub user_id: Uuid,
 }
 
 impl AppState {
-    pub fn new(orchestrator: Arc<Orchestrator>, user_store: UserStore) -> Self {
+    pub fn new(
+        orchestrator: Arc<Orchestrator>,
+        user_store: UserStore,
+        allowed_origins: Vec<String>,
+    ) -> Self {
         Self {
             orchestrator,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             user_store: Arc::new(user_store),
+            allowed_origins,
+            tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
+
+    /// 签发一次性 WS ticket，绑定 `user_id`，60s TTL。
+    pub fn issue_ticket(&self, user_id: Uuid) -> String {
+        let ticket = Uuid::new_v4().to_string();
+        let mut tickets = self.tickets.lock().expect("tickets mutex poisoned");
+        tickets.insert(ticket.clone(), (user_id, Instant::now()));
+        ticket
+    }
+
+    /// 核销 ticket：返回对应 `user_id`。TTL 过期或不存在返回 `None`。用后即焚。
+    pub fn consume_ticket(&self, ticket: &str) -> Option<Uuid> {
+        let mut tickets = self.tickets.lock().expect("tickets mutex poisoned");
+        match tickets.remove(ticket) {
+            Some((user_id, issued_at))
+                if Instant::now().duration_since(issued_at) <= TICKET_TTL =>
+            {
+                Some(user_id)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// 统一构造 500 响应：详细错误落 `tracing::error!`，响应体仅返回通用文案（SRV-010）。
+fn internal_error(e: impl std::fmt::Display) -> (StatusCode, String) {
+    tracing::error!(error = %e, "internal server error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_string(),
+    )
 }
 
 // ============ DTO ============
@@ -118,46 +167,44 @@ pub async fn chat_handler(
         None => Uuid::new_v4(),
     };
 
-    // 取出或新建会话（克隆出副本，避免在长 LLM 调用期间持锁）。
+    // 取出或新建会话：只取共享 history Arc，不深拷 messages（R2-SRV-004）。
     // 跨用户访问既存 session_id 返回 404 不泄漏存在性。
-    let mut data = {
+    let history_arc = {
         let sessions = state.sessions.read().await;
         match sessions.get(&session_id) {
-            Some(d) if d.user_id == user.id => d.clone(),
+            Some(d) if d.user_id == user.id => d.history.clone(),
             Some(_) => {
                 return Err((StatusCode::NOT_FOUND, "session not found".into()));
             }
-            None => SessionData {
-                session: Session {
-                    id: session_id,
-                    created_at: Utc::now(),
-                    messages: Vec::new(),
-                },
-                history: History::new(),
-                user_id: user.id,
-            },
+            None => Arc::new(RwLock::new(History::new())),
         }
     };
-    data.session
-        .messages
-        .push(Message::User(req.message.clone()));
 
-    let event = state
-        .orchestrator
-        .run_once(&mut data.history, req.message)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // 持 history 写锁跑 run_once，避免并发请求丢失更新（SRV-007）。
+    let event = {
+        let mut history_guard = history_arc.write().await;
+        state
+            .orchestrator
+            .run_once(&mut history_guard, req.message.clone())
+            .await
+            .map_err(internal_error)?
+    };
 
     let (text, tool_calls) = match event {
         OrchestratorEvent::Complete { text, tool_calls } => (text, tool_calls),
         OrchestratorEvent::Error { message } => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, message))
-        }
-        other => {
+            tracing::error!(error = %message, "orchestrator error");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unexpected event: {:?}", other),
-            ))
+                "internal server error".to_string(),
+            ));
+        }
+        other => {
+            tracing::error!(event = ?other, "unexpected orchestrator event");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ));
         }
     };
 
@@ -166,17 +213,38 @@ pub async fn chat_handler(
         .map(|r| ToolCall {
             id: r.id.clone(),
             tool: r.name.clone(),
-            input: serde_json::Value::Null,
+            input: r.input.clone(),
         })
         .collect();
-    data.session.messages.push(Message::Assistant(AssistantMsg {
-        text: text.clone(),
-        tool_calls: assistant_tool_calls,
-    }));
-
+    // R2-SRV-004：写回时 append 新消息而非整体 insert，避免并发请求互相覆盖。
+    let new_messages = vec![
+        Message::User(req.message.clone()),
+        Message::Assistant(AssistantMsg {
+            text: text.clone(),
+            tool_calls: assistant_tool_calls,
+        }),
+    ];
     {
         let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id, data);
+        match sessions.get_mut(&session_id) {
+            Some(d) => {
+                d.session.messages.extend(new_messages);
+            }
+            None => {
+                sessions.insert(
+                    session_id,
+                    SessionData {
+                        session: Session {
+                            id: session_id,
+                            created_at: Utc::now(),
+                            messages: new_messages,
+                        },
+                        history: history_arc,
+                        user_id: user.id,
+                    },
+                );
+            }
+        }
     }
 
     Ok(Json(ChatResponseDto {
@@ -248,7 +316,7 @@ pub async fn compile_prompt(
         .orchestrator
         .compile_prompt(&req.profile)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
     Ok(Json(CompilePromptResponseDto { prompt }))
 }
 
@@ -260,6 +328,6 @@ pub async fn list_sections(
         .orchestrator
         .list_sections(&q.profile)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
     Ok(Json(sections))
 }

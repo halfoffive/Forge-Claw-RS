@@ -24,6 +24,7 @@ target
 /target
 /web/node_modules
 /web/dist
+/.pnpm-store
 
 # Editor swap files
 *.swp

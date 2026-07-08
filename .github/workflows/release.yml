@@ -8,10 +8,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +39,10 @@ jobs:
             archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            use-cross: false
+            archive: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
             use-cross: false
             archive: zip
     steps:
