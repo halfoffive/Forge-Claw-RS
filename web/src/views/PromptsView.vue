@@ -1,0 +1,182 @@
+<script setup lang="ts">
+import { ref } from 'vue'
+
+import { compilePrompt, listSections } from '@/api/client'
+import { useAuthStore } from '@/stores/auth'
+
+interface Section {
+  id: string
+  title: string
+  body: string
+}
+
+const auth = useAuthStore()
+const profile = ref('default')
+const body = ref('')
+const compiled = ref('')
+const sections = ref<Section[]>([])
+const loading = ref(false)
+const error = ref<string | null>(null)
+
+async function loadSections(): Promise<void> {
+  if (!auth.token) return
+  loading.value = true
+  error.value = null
+  try {
+    const data = await listSections(auth.token, profile.value)
+    sections.value = data as Section[]
+    if (sections.value.length > 0) {
+      body.value = sections.value
+        .map((s) => `## ${s.title}\n${s.body}`)
+        .join('\n\n')
+    }
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    loading.value = false
+  }
+}
+
+async function doCompile(): Promise<void> {
+  if (!auth.token) return
+  loading.value = true
+  error.value = null
+  try {
+    const res = await compilePrompt(auth.token, profile.value)
+    compiled.value = res.prompt
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    loading.value = false
+  }
+}
+</script>
+
+<template>
+  <div class="prompts-view">
+    <h2>提示词</h2>
+    <div class="toolbar">
+      <input
+        v-model="profile"
+        class="profile-input"
+        type="text"
+        placeholder="profile"
+      />
+      <button class="btn" type="button" @click="loadSections">加载章节</button>
+      <button class="btn btn-primary" type="button" @click="doCompile">编译</button>
+    </div>
+
+    <p v-if="loading" class="loading">加载中…</p>
+    <p v-if="error" class="error">{{ error }}</p>
+
+    <div class="card">
+      <h3 class="card-title">编辑器</h3>
+      <textarea
+        v-model="body"
+        class="editor"
+        placeholder="提示词内容..."
+        rows="12"
+      />
+    </div>
+
+    <div v-if="compiled" class="card">
+      <h3 class="card-title">编译结果</h3>
+      <pre class="compiled">{{ compiled }}</pre>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.prompts-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: var(--space);
+  height: 100%;
+  overflow-y: auto;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.profile-input {
+  width: 200px;
+  padding: 6px 10px;
+  font-size: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+.btn {
+  padding: 6px 14px;
+  font-size: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg);
+  color: var(--color-text);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn:hover {
+  background: var(--color-surface);
+}
+
+.btn-primary {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: var(--color-primary);
+}
+
+.btn-primary:hover {
+  opacity: 0.9;
+  background: var(--color-primary);
+}
+
+.card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--color-surface);
+}
+
+.card-title {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-muted);
+}
+
+.editor {
+  width: 100%;
+  font-size: 13px;
+  font-family: var(--mono, monospace);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  resize: vertical;
+}
+
+.compiled {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: var(--mono, monospace);
+  font-size: 13px;
+  color: var(--color-text);
+}
+
+.loading {
+  color: var(--color-muted);
+}
+
+.error {
+  color: var(--color-danger, #d03050);
+}
+</style>

@@ -23,6 +23,7 @@ const navItems = [
   { name: 'chat', label: '对话', to: '/chat' },
   { name: 'sessions', label: '会话', to: '/sessions' },
   { name: 'tools', label: '工具', to: '/tools' },
+  { name: 'prompts', label: '提示词', to: '/prompts' },
   { name: 'settings', label: '设置', to: '/settings' },
 ] as const
 

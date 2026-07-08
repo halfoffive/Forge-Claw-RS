@@ -354,6 +354,58 @@ async fn run_once_llm_error_does_not_modify_history() {
 }
 
 #[tokio::test]
+async fn run_once_tool_error_feeds_error_into_history() {
+    // 工具执行失败后，回填给 LLM 的 tool_msg.content 应包含错误描述，而不是空字符串。
+    let scripts = vec![
+        vec![Event::ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("nope_tool".into()),
+            arguments: Some("{}".into()),
+        }],
+        vec![Event::Delta("ok".into()), Event::Done],
+    ];
+    let (orch, _dir) = build_orch(scripts);
+    let mut history = History::with_system("sys");
+    orch.run_once(&mut history, "x".into()).await.unwrap();
+
+    // system + user + assistant(tool_calls) + tool + assistant("ok") = 5
+    assert_eq!(history.len(), 5);
+    let tool_msg = &history.messages()[3];
+    assert_eq!(tool_msg.role, Role::Tool);
+    assert!(
+        tool_msg.content.contains("error:"),
+        "tool_msg.content should contain error description, got {:?}",
+        tool_msg.content
+    );
+    assert!(tool_msg.content.contains("nope_tool"));
+}
+
+#[tokio::test]
+async fn run_once_max_turns_exceeded_returns_error() {
+    // LLM 每轮都返回工具调用，25 轮后应因 max_turns 超限返回 Error。
+    let scripts: Vec<Vec<Event>> = (0..25)
+        .map(|_| {
+            vec![Event::ToolCallDelta {
+                index: 0,
+                id: Some("c1".into()),
+                name: Some("read".into()),
+                arguments: Some("{\"path\":\"a.txt\"}".into()),
+            }]
+        })
+        .collect();
+    let (orch, dir) = build_orch(scripts);
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+
+    let mut history = History::with_system("sys");
+    let event = orch.run_once(&mut history, "loop".into()).await.unwrap();
+    match event {
+        OrchestratorEvent::Error { message } => assert_eq!(message, "max turns exceeded"),
+        other => panic!("expected max turns error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn compile_prompt_with_real_profiles_succeeds() {
     // 验证 compile_prompt 走通真实 prompts 目录
     let dir = tempdir().unwrap();
