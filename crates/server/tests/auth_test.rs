@@ -2,11 +2,13 @@
 //!
 //! 用 `tower::ServiceExt::oneshot` 发请求，不打真实 LLM API（MockClient 返回空 Done）。
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use forgeclaw_core::model::Session;
 use forgeclaw_llm::{ChatRequest, Event, History, LlmClient};
@@ -143,6 +145,7 @@ async fn login_with_correct_credentials_returns_user() {
                 .method("POST")
                 .uri("/api/auth/login")
                 .header("content-type", "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))))
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -152,8 +155,11 @@ async fn login_with_correct_credentials_returns_user() {
     let v = body_to_json(response.into_body()).await;
     assert_eq!(v["ok"], true);
     assert_eq!(v["user"]["name"], "alice");
-    assert_eq!(v["user"]["token"], ALICE_TOKEN);
+    // SRV-024：token 不在响应体中
+    assert!(v["user"].get("token").is_none());
     assert!(v["user"]["id"].is_string());
+    // SRV-002：login 签发一次性 WS ticket
+    assert!(v.get("ticket").and_then(|t| t.as_str()).is_some());
 }
 
 #[tokio::test]
@@ -166,6 +172,7 @@ async fn login_with_wrong_token_returns_401() {
                 .method("POST")
                 .uri("/api/auth/login")
                 .header("content-type", "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))))
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -184,6 +191,7 @@ async fn login_with_unknown_user_returns_401() {
                 .method("POST")
                 .uri("/api/auth/login")
                 .header("content-type", "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))))
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -203,6 +211,7 @@ async fn login_endpoint_does_not_require_auth() {
                 .method("POST")
                 .uri("/api/auth/login")
                 .header("content-type", "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))))
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -229,7 +238,7 @@ async fn insert_session_for(state: &AppState, user_name: &str) -> Uuid {
                 created_at: chrono::Utc::now(),
                 messages: Vec::new(),
             },
-            history: History::new(),
+            history: Arc::new(tokio::sync::RwLock::new(History::new())),
             user_id: user.id,
         },
     );
@@ -313,7 +322,7 @@ async fn isolation_alice_get_own_session_returns_200() {
     assert_eq!(v["id"], alice_sid.to_string());
 }
 
-// ============ WebSocket query token 鉴权（升级前 401） ============
+// ============ WebSocket 一次性 ticket 鉴权（升级前 401） ============
 
 /// 构造一个 WS 升级请求（带必要头）。
 fn ws_request(uri: &str) -> Request<Body> {
@@ -329,31 +338,33 @@ fn ws_request(uri: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn ws_without_token_returns_401() {
+async fn ws_without_ticket_returns_401() {
     let (state, _dir) = build_state();
     let response = app(state).oneshot(ws_request("/ws/chat")).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn ws_with_wrong_token_returns_401() {
+async fn ws_with_wrong_ticket_returns_401() {
     let (state, _dir) = build_state();
     let response = app(state)
-        .oneshot(ws_request("/ws/chat?token=wrong-token"))
+        .oneshot(ws_request("/ws/chat?ticket=wrong-ticket"))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn ws_with_valid_token_passes_auth() {
+async fn ws_with_valid_ticket_passes_auth() {
     let (state, _dir) = build_state();
+    let alice = state.user_store.find_by_name("alice").expect("user exists");
+    let ticket = state.issue_ticket(alice.id);
     let response = app(state)
-        .oneshot(ws_request(&format!("/ws/chat?token={ALICE_TOKEN}")))
+        .oneshot(ws_request(&format!("/ws/chat?ticket={ticket}")))
         .await
         .unwrap();
-    // 有效 token 通过鉴权后，oneshot 无真实 hyper 连接 → WebSocketUpgrade 返回 426
-    // （ConnectionNotUpgradable）。关键：不是 401，证明 token 校验已通过。
+    // 有效 ticket 通过鉴权后，oneshot 无真实 hyper 连接 → WebSocketUpgrade 返回 426
+    // （ConnectionNotUpgradable）。关键：不是 401，证明 ticket 校验已通过。
     assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
 }

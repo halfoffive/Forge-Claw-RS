@@ -62,22 +62,30 @@ fn is_sensitive_path(path: &Path) -> bool {
     false
 }
 
-/// 把 `~/...` 展开为 `$HOME/...`，其余原样返回。
-fn expand_tilde(p: &str) -> String {
+/// 把 `~/...` 展开为 `$HOME/...`。
+///
+/// - 非 `~` 开头路径：返回 `Some(原样)`。
+/// - `~` / `~/...` 且 `HOME` 已设置：返回 `Some(展开后)`。
+/// - `~` / `~/...` 但 `HOME` 未设置：返回 `None`（不再返回字面量 `~`，避免下游误用）。
+fn expand_tilde(p: &str) -> Option<String> {
     if p == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+        return std::env::var("HOME").ok();
     }
     if let Some(rest) = p.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
-            return format!("{}/{}", home, rest);
+            return Some(format!("{}/{}", home, rest));
         }
+        return None;
     }
-    p.to_string()
+    Some(p.to_string())
 }
 
 /// 把输入路径解析为绝对路径：先展开 `~`，相对路径则拼到 `base` 下。
+///
+/// 若 `~` 无法展开（HOME 未设置），退化为原始输入（作为相对路径处理），
+/// 由后续 [`is_within`] canonicalize 检查保证不越界。
 fn resolve_within_base(input_path: &str, base: &Path) -> PathBuf {
-    let expanded = expand_tilde(input_path);
+    let expanded = expand_tilde(input_path).unwrap_or_else(|| input_path.to_string());
     let p = Path::new(&expanded);
     if p.is_absolute() {
         p.to_path_buf()

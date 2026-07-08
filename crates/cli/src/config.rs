@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// CLI 运行配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,10 +84,10 @@ impl Config {
         Ok(cfg)
     }
 
-    /// `config init` 用的默认模板（带一个示例本地用户）。
+    /// `config init` 用的默认模板（带一个示例本地用户，随机 token）。
     pub fn default_for_init() -> Self {
         Self {
-            users: vec![("local".to_string(), "change-me".to_string())],
+            users: vec![("local".to_string(), Uuid::new_v4().to_string())],
             ..Self::default()
         }
     }
@@ -99,6 +100,11 @@ impl Config {
         }
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -121,12 +127,12 @@ pub(crate) fn load_file_or_defaults() -> Config {
     cfg
 }
 
-/// `~/.forgeclaw/config.toml` 路径（无 HOME 返回 None）。
+/// `~/.forgeclaw/config.toml` 路径（HOME → USERPROFILE 回退，皆无返回 None）。
 pub(crate) fn config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    if home.is_empty() {
-        return None;
-    }
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))?;
     Some(PathBuf::from(home).join(".forgeclaw").join("config.toml"))
 }
 

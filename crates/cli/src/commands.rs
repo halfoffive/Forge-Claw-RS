@@ -410,13 +410,30 @@ fn build_tool_input(tool: &str, args: &[String]) -> serde_json::Value {
 
 // ============ web ============
 
-pub async fn run_web(cfg: Config, port: u16) -> anyhow::Result<()> {
+pub async fn run_web(cfg: Config, host: String, port: u16) -> anyhow::Result<()> {
     let orch = build_orchestrator(&cfg, true)?;
     let users = resolve_users(&cfg);
+    if users.is_empty() {
+        bail!(
+            "未配置 web 用户：请运行 `forgeclaw config init` 生成默认配置与随机 token，\
+             或设置环境变量 FORGECLAW_USERS=name:token[,name:token]"
+        );
+    }
+    let is_loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if !is_loopback {
+        for (_name, token) in &users {
+            if token.is_empty() || token == "change-me" || token == "local-token" {
+                bail!(
+                    "绑定到非回环地址 {host} 时检测到弱 token（change-me/local-token/空），\
+                     拒绝启动。请运行 `forgeclaw config init` 生成随机 token 或手动修改配置。"
+                );
+            }
+        }
+    }
     let user_store = UserStore::from_config(users.clone());
     let state = AppState::new(orch, user_store);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("ForgeClaw Web 服务已启动: http://127.0.0.1:{port}");
+    let addr = SocketAddr::new(host.parse()?, port);
+    println!("ForgeClaw Web 服务已启动: http://{host}:{port}");
     println!(
         "可用用户: {}",
         users
@@ -431,7 +448,7 @@ pub async fn run_web(cfg: Config, port: u16) -> anyhow::Result<()> {
     server_run(addr, state).await
 }
 
-/// 解析 web 用户：env `FORGECLAW_USERS` > 配置文件 users > 默认本地用户。
+/// 解析 web 用户：env `FORGECLAW_USERS` > 配置文件 users；无则返回空 vec。
 fn resolve_users(cfg: &Config) -> Vec<(String, String)> {
     let env_raw = std::env::var("FORGECLAW_USERS").unwrap_or_default();
     if !env_raw.trim().is_empty() {
@@ -447,10 +464,8 @@ fn resolve_users(cfg: &Config) -> Vec<(String, String)> {
                 Some((n, t))
             })
             .collect()
-    } else if !cfg.users.is_empty() {
-        cfg.users.clone()
     } else {
-        vec![("local".to_string(), "local-token".to_string())]
+        cfg.users.clone()
     }
 }
 
@@ -483,6 +498,9 @@ pub fn run_config_init() -> anyhow::Result<()> {
         Some(p) => println!("已写入默认配置: {}", p.display()),
         None => println!("已写入默认配置"),
     }
+    if let Some((_, token)) = cfg.users.first() {
+        println!("已生成随机登录 token（请妥善保存，仅显示一次）: {token}");
+    }
     println!("请编辑该文件填入 api_key，或设置环境变量 DEEPSEEK_API_KEY。");
     Ok(())
 }
@@ -501,7 +519,11 @@ pub fn run_config_set(key: &str, value: &str) -> anyhow::Result<()> {
         ),
     }
     cfg.save()?;
-    println!("已设置 {key} = {value}");
+    if key == "api_key" {
+        println!("已设置 {key} = {}", cfg.masked_api_key());
+    } else {
+        println!("已设置 {key} = {value}");
+    }
     Ok(())
 }
 
@@ -569,12 +591,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_users_defaults_to_local() {
-        // 无 env 无配置 → 默认本地用户
+    fn resolve_users_empty_when_no_config() {
+        // 无 env 无配置 → 空 vec（不再兜底 local-token）
         std::env::remove_var("FORGECLAW_USERS");
         let cfg = Config::default();
         let u = resolve_users(&cfg);
-        assert_eq!(u, vec![("local".to_string(), "local-token".to_string())]);
+        assert!(u.is_empty());
     }
 
     #[test]

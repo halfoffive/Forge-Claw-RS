@@ -42,8 +42,11 @@ impl PromptEngine {
         self.compile_count
     }
 
-    fn profile_path(&self, profile_name: &str) -> PathBuf {
-        self.profiles_root.join(format!("{profile_name}.toml"))
+    fn profile_path(&self, profile_name: &str) -> Result<PathBuf> {
+        if !is_safe_name(profile_name) {
+            return Err(CoreError::ProfileNotFound(profile_name.to_string()));
+        }
+        Ok(self.profiles_root.join(format!("{profile_name}.toml")))
     }
 
     /// section 路径相对提示词根（profiles_root 的父目录）解析。
@@ -55,19 +58,27 @@ impl PromptEngine {
     }
 
     fn load_all_sections(&self, profile_name: &str) -> Result<Vec<Section>> {
-        let path = self.profile_path(profile_name);
-        if !path.exists() {
-            return Err(CoreError::ProfileNotFound(profile_name.to_string()));
-        }
-        let profile = load_profile(&path)?;
+        let path = self.profile_path(profile_name)?;
+        let profile = load_profile(&path).map_err(|e| match e {
+            CoreError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                CoreError::ProfileNotFound(profile_name.to_string())
+            }
+            other => other,
+        })?;
         let base = self.sections_base();
         let mut sections = Vec::with_capacity(profile.sections.len());
         for (name, rel) in profile.sections {
-            let abs = base.join(&rel);
-            if !abs.exists() {
+            if !is_safe_name(&name) {
                 return Err(CoreError::SectionNotFound(name, rel));
             }
-            sections.push(load_section_file(&abs)?);
+            let abs = base.join(&rel);
+            let section = load_section_file(&abs).map_err(|e| match e {
+                CoreError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    CoreError::SectionNotFound(name, rel)
+                }
+                other => other,
+            })?;
+            sections.push(section);
         }
         Ok(sections)
     }
@@ -113,9 +124,18 @@ impl PromptEngine {
     }
 }
 
-/// 按 `order` 升序排序，过滤 `enabled=false`。
+/// 校验名字仅含 `[A-Za-z0-9_-]`：拒绝 `..` / `/` / `\` / `\0` 等路径遍历字符。
+fn is_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('\0')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 按 `order` 升序排序，相同 order 时以 `id` 作 tiebreaker；过滤 `enabled=false`。
 fn enabled_sorted(mut sections: Vec<Section>) -> Vec<Section> {
-    sections.sort_by_key(|s| s.order);
+    sections.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
     sections.retain(|s| s.enabled);
     sections
 }
@@ -249,5 +269,19 @@ mod tests {
         let engine = PromptEngine::new(profiles_root());
         let err = engine.list_sections("does-not-exist").unwrap_err();
         assert!(matches!(err, CoreError::ProfileNotFound(_)));
+    }
+
+    #[test]
+    fn profile_name_traversal_rejected() {
+        let engine = PromptEngine::new(profiles_root());
+        for bad in ["../etc", "a/b", "a\\b", "..", "a\x00b", "a.b"] {
+            let err = engine.list_sections(bad).unwrap_err();
+            assert!(
+                matches!(err, CoreError::ProfileNotFound(_)),
+                "expected ProfileNotFound for {:?}, got {:?}",
+                bad,
+                err
+            );
+        }
     }
 }

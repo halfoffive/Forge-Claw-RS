@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use forgeclaw_llm::{ChatRequest, Event, History, LlmClient};
+use forgeclaw_llm::{ChatRequest, Event, History, LlmClient, Role};
 use forgeclaw_server::{
     default_sandbox_with_specs, restricted_sandbox_with_specs, Orchestrator, OrchestratorEvent,
     SubagentRole,
@@ -76,8 +76,8 @@ async fn run_once_completes_without_tool_calls() {
     }
     // system + user + assistant = 3
     assert_eq!(history.len(), 3);
-    assert_eq!(history.messages()[1].role, "user");
-    assert_eq!(history.messages()[2].role, "assistant");
+    assert_eq!(history.messages()[1].role, Role::User);
+    assert_eq!(history.messages()[2].role, Role::Assistant);
 }
 
 #[tokio::test]
@@ -117,12 +117,12 @@ async fn run_once_executes_tool_calls_and_loops() {
     // system + user + assistant(tool_calls) + tool + assistant("done") = 5
     assert_eq!(history.len(), 5);
     let assistant = &history.messages()[2];
-    assert_eq!(assistant.role, "assistant");
+    assert_eq!(assistant.role, Role::Assistant);
     let tcs = assistant.tool_calls.as_ref().expect("tool_calls present");
     assert_eq!(tcs.len(), 1);
     assert_eq!(tcs[0].function.name, "read");
     let tool_msg = &history.messages()[3];
-    assert_eq!(tool_msg.role, "tool");
+    assert_eq!(tool_msg.role, Role::Tool);
     assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_1"));
     assert_eq!(tool_msg.content, "hello-content");
 }

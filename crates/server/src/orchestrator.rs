@@ -27,6 +27,10 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::warn;
+use uuid::Uuid;
+
+/// run_turn 默认最大轮数（SRV-004）。
+const DEFAULT_MAX_TURNS: usize = 25;
 
 /// 子代理角色。
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +166,7 @@ impl Orchestrator {
             history,
             user_msg,
             None,
+            DEFAULT_MAX_TURNS,
         )
         .await
     }
@@ -184,6 +189,7 @@ impl Orchestrator {
             history,
             user_msg,
             Some(&tx),
+            DEFAULT_MAX_TURNS,
         )
         .await?;
         Ok(())
@@ -209,6 +215,7 @@ impl Orchestrator {
                     &mut history,
                     std::mem::take(&mut msg),
                     None,
+                    DEFAULT_MAX_TURNS,
                 )
                 .await
             {
@@ -223,7 +230,13 @@ impl Orchestrator {
     /// 核心单轮循环：append user → 反复 (LLM 调用 → 工具执行 → 回填) 直到无工具调用。
     ///
     /// `tx` 为 `Some` 时把流式事件推入 channel。`sandbox` / `tool_specs` 可被
-    /// 覆盖（子代理用受限集合）。
+    /// 覆盖（子代理用受限集合）。`max_turns` 限制 LLM 调用轮数（SRV-004）。
+    ///
+    /// 行为约定：
+    /// - `Event::Error` 立即返回 `OrchestratorEvent::Error`，不构造 assistant_msg、不 append（SRV-005）。
+    /// - `tx.send` 失败（客户端断开）立即返回 Error 停止生成（SRV-012）。
+    /// - `parse_tool_input` 失败时构造错误 ToolResult 回填，不执行工具（SRV-019）。
+    /// - 空 `tool_call_id` 自动生成 `call_<uuid>`（SRV-020）。
     async fn run_turn(
         &self,
         sandbox: &Sandbox,
@@ -231,11 +244,24 @@ impl Orchestrator {
         history: &mut History,
         user_msg: String,
         tx: Option<&mpsc::Sender<OrchestratorEvent>>,
+        max_turns: usize,
     ) -> anyhow::Result<OrchestratorEvent> {
         history.append(ChatMessage::user(user_msg));
         let mut records: Vec<ToolCallRecord> = Vec::new();
 
+        let mut turn = 0usize;
         loop {
+            turn += 1;
+            if turn > max_turns {
+                let event = OrchestratorEvent::Error {
+                    message: "max turns exceeded".into(),
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(event.clone()).await;
+                }
+                return Ok(event);
+            }
+
             let req = ChatRequest::from_history(
                 history,
                 &self.model,
@@ -252,7 +278,11 @@ impl Orchestrator {
                     Event::Delta(s) => {
                         text.push_str(&s);
                         if let Some(tx) = tx {
-                            let _ = tx.send(OrchestratorEvent::Delta { text: s }).await;
+                            if tx.send(OrchestratorEvent::Delta { text: s }).await.is_err() {
+                                return Ok(OrchestratorEvent::Error {
+                                    message: "client disconnected".into(),
+                                });
+                            }
                         }
                     }
                     Event::ToolCallDelta {
@@ -273,12 +303,22 @@ impl Orchestrator {
                         }
                     }
                     Event::Done => {}
+                    // SRV-005：流内错误立即返回 Error，不构造 assistant_msg、不 append。
                     Event::Error(message) => {
                         warn!(%message, "llm stream error event");
+                        let event = OrchestratorEvent::Error { message };
                         if let Some(tx) = tx {
-                            let _ = tx.send(OrchestratorEvent::Error { message }).await;
+                            let _ = tx.send(event.clone()).await;
                         }
+                        return Ok(event);
                     }
+                }
+            }
+
+            // SRV-020：空 tool_call_id 自动补全，保证 assistant_msg 与 tool_msg 引用一致。
+            for agg in tcs.values_mut() {
+                if agg.id.is_empty() {
+                    agg.id = format!("call_{}", Uuid::new_v4());
                 }
             }
 
@@ -301,36 +341,79 @@ impl Orchestrator {
                     tool_calls: records,
                 };
                 if let Some(tx) = tx {
-                    let _ = tx.send(event.clone()).await;
+                    if tx.send(event.clone()).await.is_err() {
+                        return Ok(OrchestratorEvent::Error {
+                            message: "client disconnected".into(),
+                        });
+                    }
                 }
                 return Ok(event);
             }
 
             for agg in tcs.into_values() {
-                let input = parse_tool_input(&agg.arguments);
-                if let Some(tx) = tx {
-                    let _ = tx
-                        .send(OrchestratorEvent::ToolCallStart {
-                            name: agg.name.clone(),
-                            input: input.clone(),
-                        })
-                        .await;
-                }
-                let result = match sandbox.execute(&agg.name, input).await {
-                    Ok(r) => r,
-                    Err(e) => ToolResult {
-                        output: String::new(),
-                        error: Some(e.to_string()),
-                        duration_ms: 0,
-                    },
+                let parsed = parse_tool_input(&agg.arguments);
+                // SRV-019：parse 失败时构造错误 ToolResult 回填，不执行工具。
+                let result = match parsed {
+                    Ok(v) => {
+                        if let Some(tx) = tx {
+                            if tx
+                                .send(OrchestratorEvent::ToolCallStart {
+                                    name: agg.name.clone(),
+                                    input: v.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return Ok(OrchestratorEvent::Error {
+                                    message: "client disconnected".into(),
+                                });
+                            }
+                        }
+                        match sandbox.execute(&agg.name, v).await {
+                            Ok(r) => r,
+                            Err(e) => ToolResult {
+                                output: String::new(),
+                                error: Some(e.to_string()),
+                                duration_ms: 0,
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("invalid tool input: {e}");
+                        if let Some(tx) = tx {
+                            if tx
+                                .send(OrchestratorEvent::ToolCallStart {
+                                    name: agg.name.clone(),
+                                    input: Value::Null,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return Ok(OrchestratorEvent::Error {
+                                    message: "client disconnected".into(),
+                                });
+                            }
+                        }
+                        ToolResult {
+                            output: String::new(),
+                            error: Some(err_msg),
+                            duration_ms: 0,
+                        }
+                    }
                 };
                 if let Some(tx) = tx {
-                    let _ = tx
+                    if tx
                         .send(OrchestratorEvent::ToolResult {
                             name: agg.name.clone(),
                             result: result.clone(),
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return Ok(OrchestratorEvent::Error {
+                            message: "client disconnected".into(),
+                        });
+                    }
                 }
                 records.push(ToolCallRecord {
                     id: agg.id.clone(),
@@ -369,11 +452,13 @@ impl From<&ToolCallAgg> for ToolCallDto {
     }
 }
 
-fn parse_tool_input(args: &str) -> Value {
+/// 解析工具调用 arguments JSON 字符串。空串视为空对象。
+/// 解析失败返回 `Err`，由 [`Orchestrator::run_turn`] 构造错误 ToolResult 回填（SRV-019）。
+fn parse_tool_input(args: &str) -> Result<Value, serde_json::Error> {
     if args.trim().is_empty() {
-        return Value::Object(serde_json::Map::new());
+        return Ok(Value::Object(serde_json::Map::new()));
     }
-    serde_json::from_str(args).unwrap_or(Value::Null)
+    serde_json::from_str(args)
 }
 
 fn subagent_system_prompt(role: SubagentRole) -> String {
