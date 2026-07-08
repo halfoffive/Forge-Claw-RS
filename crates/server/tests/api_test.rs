@@ -55,7 +55,10 @@ fn build_state() -> (AppState, tempfile::TempDir) {
         AppState::new(
             Arc::new(orch),
             user_store,
-            vec!["http://localhost:5173".to_string()],
+            vec![
+                "http://localhost:5173".to_string(),
+                "http://localhost:8080".to_string(),
+            ],
         ),
         dir,
     )
@@ -93,7 +96,10 @@ fn build_state_with_error_client() -> (AppState, tempfile::TempDir) {
         AppState::new(
             Arc::new(orch),
             user_store,
-            vec!["http://localhost:5173".to_string()],
+            vec![
+                "http://localhost:5173".to_string(),
+                "http://localhost:8080".to_string(),
+            ],
         ),
         dir,
     )
