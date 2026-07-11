@@ -15,6 +15,10 @@ pub enum CoreError {
     #[error("toml deserialize error: {0}")]
     Toml(#[from] toml::de::Error),
 
+    /// TOML 序列化错误。
+    #[error("toml serialize error: {0}")]
+    TomlSerialize(String),
+
     /// 通用解析错误（frontmatter 字段缺失、非法值等）。
     #[error("parse error: {0}")]
     Parse(String),

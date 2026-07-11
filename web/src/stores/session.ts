@@ -64,6 +64,11 @@ export const useSessionStore = defineStore('session', () => {
     currentMessages.value.pop()
   }
 
+  /** 撤销最后 count 次 push。 */
+  function popMessages(count: number): void {
+    for (let i = 0; i < count; i++) currentMessages.value.pop()
+  }
+
   function reset(): void {
     sessions.value = []
     currentId.value = null
@@ -83,6 +88,7 @@ export const useSessionStore = defineStore('session', () => {
     setCurrentId,
     pushMessage,
     popMessage,
+    popMessages,
     reset,
   }
 })

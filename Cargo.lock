@@ -659,6 +659,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "forgeclaw-core",
+ "libc",
  "regex",
  "serde_json",
  "tempfile",

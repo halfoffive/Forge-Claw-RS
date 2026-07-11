@@ -5,7 +5,8 @@
 // - 30s 超时（AbortController），401 抛 ApiError 以便上层清理会话。
 // - base 默认相对路径（依赖 vite 代理 /api → localhost:8080）；
 //   settings store 可通过 setApiBase 切换到其他后端地址。
-// - WS 走一次性 ticket：先 GET /api/auth/ticket，再拼 ws(s)://host/ws/chat?ticket=。
+// - WS 走一次性 ticket：先 GET /api/auth/ticket，再通过 WebSocket 子协议头传递，
+//   不在 URL 中暴露 ticket。
 
 import type {
   LoginResponse,
@@ -14,6 +15,16 @@ import type {
   TicketResponse,
   ToolInfo,
 } from './types'
+
+/** 提示词章节。 */
+export interface Section {
+  id: string
+  title: string
+  level: string
+  enabled: boolean
+  order: number
+  body: string
+}
 
 /** API 错误（携带状态码与后端消息）。 */
 export class ApiError extends Error {
@@ -154,11 +165,26 @@ export function listSections(
   )
 }
 
+/** `PUT /api/prompts/sections`：保存 profile 的章节。 */
+export function saveSections(
+  token: string,
+  profile: string,
+  sections: Section[],
+): Promise<void> {
+  return request<void>('/api/prompts/sections', token, {
+    method: 'PUT',
+    body: JSON.stringify({ profile, sections }),
+  })
+}
+
 /**
- * 拼接 WebSocket URL：`ws(s)://host/ws/chat?ticket=<ticket>`。
+ * 拼接 WebSocket URL：`ws(s)://host/ws/chat`。
  * host 取自 apiBase（若已配置绝对地址）或当前页面 origin。
+ *
+ * ticket 不再拼接到 URL，而是由调用方通过 `new WebSocket(url, ['forgeclaw', ticket])`
+ * 作为子协议传递，避免被代理访问日志记录。
  */
-export function buildWsUrl(ticket: string): string {
+export function buildWsUrl(): string {
   let origin: string
   if (apiBase && /^https?:\/\//.test(apiBase)) {
     origin = apiBase.replace(/^http/, 'ws')
@@ -168,5 +194,5 @@ export function buildWsUrl(ticket: string): string {
   } else {
     origin = 'ws://localhost:8080'
   }
-  return `${origin}/ws/chat?ticket=${encodeURIComponent(ticket)}`
+  return `${origin}/ws/chat`
 }

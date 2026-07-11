@@ -4,19 +4,20 @@
 //! 流式桥接：run_streaming 不内部 spawn，故在此 spawn 一个任务驱动 LLM 循环 + 推送事件，
 //! 主循环并发排空 receiver 并转发给 WS 客户端。Complete 后把更新后的 history 回写会话存储。
 //!
-//! 鉴权（SRV-002）：浏览器 WS 无法设 Authorization header，故从 `?ticket=<ticket>` query
-//! 参数取一次性 ticket，经 `AppState::consume_ticket` 核销（60s TTL、用后即焚）；无效则 401。
+//! 鉴权（SRV-002 / C-NEW-002）：浏览器 WS 无法设 Authorization header，故通过
+//! `Sec-WebSocket-Protocol: forgeclaw, <ticket>` 子协议头传递一次性 ticket，经
+//! `AppState::consume_ticket` 核销（60s TTL、用后即焚）；无效则 401。ticket 不再出现在 URL，
+//! 避免被代理访问日志记录。
 //!
 //! 心跳与超时（SRV-003/SRV-009）：拆分 socket 为 reader/writer，独立 ping 任务每 30s 发 Ping；
 //! 每帧读 60s 超时，单连接整体 600s 超时。WS 单帧/单消息上限 256KB（SRV-014）。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Query, Request, State};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
@@ -26,11 +27,11 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use chrono::Utc;
-use forgeclaw_core::model::{AssistantMsg, Message as CoreMessage, Session, ToolCall};
+use forgeclaw_core::model::Session;
 use forgeclaw_llm::History;
 
-use crate::api::{AppState, SessionData};
-use crate::orchestrator::{OrchestratorEvent, ToolCallRecord};
+use crate::api::{history_to_messages, AppState, SessionData};
+use crate::orchestrator::OrchestratorEvent;
 
 /// WS 读帧超时（SRV-003）：60s 无帧即关闭。
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -49,28 +50,63 @@ struct WsChatRequest {
     session_id: Option<String>,
 }
 
-/// `/ws/chat` 升级处理器。从 `?ticket=` query 参数核销一次性 ticket 鉴权（SRV-002）。
+/// `/ws/chat` 升级处理器。从 `Sec-WebSocket-Protocol` 子协议头核销一次性 ticket 鉴权（SRV-002 / C-NEW-002）。
 ///
 /// 浏览器 WS 无法设 Authorization header，故用一次性 ticket：客户端先调
 /// `/api/auth/login` 或 `/api/auth/ticket`（Bearer 鉴权）获取短期 ticket，
-/// 再凭 `?ticket=<ticket>` 升级 WS。ticket 60s TTL、用后即焚。
+/// 再在 `new WebSocket(url, ['forgeclaw', ticket])` 中作为子协议传递。
+/// 服务端读取 `Sec-WebSocket-Protocol: forgeclaw, <ticket>`，核销 ticket 后升级，
+/// 响应通过 `protocols(["forgeclaw"])` 确认子协议为 `forgeclaw`。ticket 60s TTL、用后即焚。
 pub async fn ws_chat_handler(
     State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
     req: Request,
 ) -> Response {
-    let user_id = match params.get("ticket").and_then(|t| state.consume_ticket(t)) {
+    let ticket = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_ticket_from_protocol_header);
+
+    let user_id = match ticket.and_then(|t| state.consume_ticket(&t)) {
         Some(u) => u,
         None => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
     };
+
     let (mut parts, _body) = req.into_parts();
     match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         Ok(ws) => ws
+            .protocols(["forgeclaw"])
             .max_message_size(MAX_WS_FRAME_SIZE)
             .max_frame_size(MAX_WS_FRAME_SIZE)
             .on_upgrade(move |socket| handle_ws(socket, state, user_id)),
         Err(rejection) => rejection.into_response(),
     }
+}
+
+/// 从 `Sec-WebSocket-Protocol` 头值中解析 ticket。
+///
+/// 头值是逗号分隔的子协议列表，例如 `forgeclaw, <ticket>`。
+/// - 若有两个及以上值，取第二个值作为 ticket；
+/// - 若只有一个值且它本身是 UUID 格式，也接受为 ticket；
+/// - 否则无 ticket。
+fn parse_ticket_from_protocol_header(header: &str) -> Option<String> {
+    let parts: Vec<_> = header
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    match parts.len() {
+        0 => None,
+        1 if looks_like_ticket(parts[0]) => Some(parts[0].to_string()),
+        1 => None,
+        _ => Some(parts[1].to_string()),
+    }
+}
+
+/// 判断字符串是否为 ticket 的格式（UUID）。
+fn looks_like_ticket(s: &str) -> bool {
+    Uuid::parse_str(s).is_ok()
 }
 
 async fn handle_ws(socket: WebSocket, state: AppState, user_id: Uuid) {
@@ -167,27 +203,33 @@ async fn handle_text_frame(
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::new_v4);
 
-    // 取出或新建会话：只取共享 history Arc，不深拷 messages（R2-SRV-004）。
+    // 取出或新建会话：单次写锁 + entry/or_insert_with 消除 read-write 之间的 TOCTOU。
+    // 同一 session_id 的并发请求始终拿到同一个 Arc<RwLock<History>>，history 与 session.messages 不会丢消息。
     // SRV-006：跨用户既存 session_id 发 Error 并 return，不创建不覆盖。
     let history_arc = {
-        let sessions = state.sessions.read().await;
-        match sessions.get(&session_id) {
-            Some(d) if d.user_id == user_id => d.history.clone(),
-            Some(_) => {
-                let _ = send_event(
-                    out_tx,
-                    &OrchestratorEvent::Error {
-                        message: "session not found".into(),
-                    },
-                )
-                .await;
-                return std::ops::ControlFlow::Continue(());
-            }
-            None => Arc::new(RwLock::new(History::new())),
+        let mut sessions = state.sessions.write().await;
+        let d = sessions.entry(session_id).or_insert_with(|| SessionData {
+            session: Session {
+                id: session_id,
+                created_at: Utc::now(),
+                messages: Vec::new(),
+            },
+            history: Arc::new(RwLock::new(History::new())),
+            user_id,
+        });
+        if d.user_id != user_id {
+            let _ = send_event(
+                out_tx,
+                &OrchestratorEvent::Error {
+                    message: "session not found".into(),
+                },
+            )
+            .await;
+            return std::ops::ControlFlow::Continue(());
         }
+        d.history.clone()
     };
 
-    let user_msg_text = req.message.clone();
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(64);
     let orch = state.orchestrator.clone();
     let user_msg = req.message;
@@ -199,18 +241,10 @@ async fn handle_text_frame(
         orch.run_streaming(&mut guard, user_msg, tx).await
     });
 
-    // 转发事件给 WS 客户端，并捕获 Complete 的 tool_calls（R2-SRV-008）。
-    let mut final_text = String::new();
-    let mut final_tool_calls: Vec<ToolCallRecord> = Vec::new();
+    // 转发事件给 WS 客户端。
     let mut got_complete = false;
     while let Some(event) = rx.recv().await {
-        if let OrchestratorEvent::Complete {
-            ref text,
-            ref tool_calls,
-        } = event
-        {
-            final_text = text.clone();
-            final_tool_calls = tool_calls.clone();
+        if matches!(event, OrchestratorEvent::Complete { .. }) {
             got_complete = true;
         }
         if send_event(out_tx, &event).await.is_err() {
@@ -225,57 +259,62 @@ async fn handle_text_frame(
     }
     drop(rx);
 
-    // 回写会话。R2-SRV-004：append 新消息而非整体 insert，避免并发覆盖。
+    // 回写会话：用 history 派生 messages 作为唯一真源（B-010）。
     // P1-SRV-002：对 spawn 任务加超时，防止 WS 断开后任务仍持 history 写锁阻塞同 session 请求。
     let res = tokio::time::timeout(TASK_TIMEOUT, join).await;
     match res {
         Ok(Ok(Ok(()))) => {
             if got_complete {
-                let assistant_tool_calls: Vec<ToolCall> = final_tool_calls
-                    .iter()
-                    .map(|r| ToolCall {
-                        id: r.id.clone(),
-                        tool: r.name.clone(),
-                        input: r.input.clone(),
-                    })
-                    .collect();
-                let new_messages = vec![
-                    CoreMessage::User(user_msg_text),
-                    CoreMessage::Assistant(AssistantMsg {
-                        text: final_text,
-                        tool_calls: assistant_tool_calls,
-                    }),
-                ];
                 let mut sessions = state.sessions.write().await;
-                match sessions.get_mut(&session_id) {
-                    Some(d) => {
-                        d.session.messages.extend(new_messages);
-                    }
-                    None => {
-                        sessions.insert(
-                            session_id,
-                            SessionData {
-                                session: Session {
-                                    id: session_id,
-                                    created_at: Utc::now(),
-                                    messages: new_messages,
-                                },
-                                history: history_arc,
-                                user_id,
-                            },
-                        );
-                    }
+                let d = sessions
+                    .get_mut(&session_id)
+                    .expect("session must exist after entry/or_insert_with");
+                // C-NEW-003：写回前再次复核 user_id，防止跨用户竞态污染。
+                if d.user_id != user_id {
+                    let _ = send_event(
+                        out_tx,
+                        &OrchestratorEvent::Error {
+                            message: "session not found".into(),
+                        },
+                    )
+                    .await;
+                    return std::ops::ControlFlow::Break(());
                 }
+                d.session.messages = history_to_messages(&*history_arc.read().await);
             }
         }
         Ok(Ok(Err(e))) => {
             tracing::error!(error = %e, "run_streaming failed");
+            let _ = send_event(
+                out_tx,
+                &OrchestratorEvent::Error {
+                    message: "internal error".into(),
+                },
+            )
+            .await;
+            return std::ops::ControlFlow::Break(());
         }
         Ok(Err(_)) => {
             tracing::error!("orchestrator task panicked");
+            let _ = send_event(
+                out_tx,
+                &OrchestratorEvent::Error {
+                    message: "orchestrator task panicked".into(),
+                },
+            )
+            .await;
+            return std::ops::ControlFlow::Break(());
         }
         Err(_) => {
             tracing::error!("orchestrator task timed out after 300s");
+            let _ = send_event(
+                out_tx,
+                &OrchestratorEvent::Error {
+                    message: "orchestrator task timed out".into(),
+                },
+            )
+            .await;
+            return std::ops::ControlFlow::Break(());
         }
     }
 

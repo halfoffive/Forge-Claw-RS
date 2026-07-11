@@ -14,17 +14,19 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use crate::error::{CoreError, Result};
 use crate::model::Section;
-use crate::prompt::profile::load_profile;
-use crate::prompt::section::load_section_file;
+use crate::prompt::profile::{load_profile, save_profile};
+use crate::prompt::section::{load_section_file, serialize_section};
 
 /// 提示词编译引擎。
 pub struct PromptEngine {
     profiles_root: PathBuf,
-    cache: HashMap<u64, String>,
-    compile_count: usize,
+    cache: Arc<RwLock<HashMap<u64, String>>>,
+    compile_count: AtomicUsize,
 }
 
 impl PromptEngine {
@@ -32,14 +34,14 @@ impl PromptEngine {
     pub fn new(profiles_root: PathBuf) -> Self {
         Self {
             profiles_root,
-            cache: HashMap::new(),
-            compile_count: 0,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            compile_count: AtomicUsize::new(0),
         }
     }
 
     /// 实际编译次数（不含缓存命中）。用于测试与可观测性。
     pub fn compile_count(&self) -> usize {
-        self.compile_count
+        self.compile_count.load(Ordering::Relaxed)
     }
 
     fn profile_path(&self, profile_name: &str) -> Result<PathBuf> {
@@ -89,20 +91,57 @@ impl PromptEngine {
         Ok(enabled_sorted(sections))
     }
 
+    /// 保存 sections：按 id 更新对应文件，profile 中不存在则新建，并刷新缓存。
+    pub fn save_sections(&self, profile_name: &str, sections: Vec<Section>) -> Result<()> {
+        let path = self.profile_path(profile_name)?;
+        let mut profile = load_profile(&path)?;
+        let base = self.sections_base();
+
+        // 若出现新 section，追加到 profile 并指向 sections/{id}.md。
+        let mut profile_changed = false;
+        for section in &sections {
+            if !profile.sections.iter().any(|(id, _)| id == &section.id) {
+                let rel = PathBuf::from("sections").join(format!("{}.md", section.id));
+                profile.sections.push((section.id.clone(), rel));
+                profile_changed = true;
+            }
+        }
+        if profile_changed {
+            save_profile(&path, &profile)?;
+        }
+
+        for section in sections {
+            let rel = profile
+                .sections
+                .iter()
+                .find(|(id, _)| id == &section.id)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| PathBuf::from("sections").join(format!("{}.md", section.id)));
+            let abs = base.join(&rel);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&abs, serialize_section(&section))?;
+        }
+
+        self.cache.write().unwrap().clear();
+        Ok(())
+    }
+
     /// 编译 profile 为最终 system prompt。
     ///
     /// `vars` 中常见的 key：`tools` / `model` / `cwd`，
     /// 会替换 section body 中的 `{{tools}}` / `{{model}}` / `{{cwd}}`。
-    pub fn compile(&mut self, profile_name: &str, vars: &HashMap<&str, String>) -> Result<String> {
+    pub fn compile(&self, profile_name: &str, vars: &HashMap<&str, String>) -> Result<String> {
         let sections = self.load_all_sections(profile_name)?;
         let enabled = enabled_sorted(sections);
 
         let key = compute_cache_key(profile_name, &enabled, vars);
-        if let Some(cached) = self.cache.get(&key) {
+        if let Some(cached) = self.cache.read().unwrap().get(&key) {
             return Ok(cached.clone());
         }
 
-        self.compile_count += 1;
+        self.compile_count.fetch_add(1, Ordering::Relaxed);
 
         let mut output = String::new();
         for section in &enabled {
@@ -119,7 +158,7 @@ impl PromptEngine {
             output = output.replace(&format!("{{{{{k}}}}}"), v);
         }
 
-        self.cache.insert(key, output.clone());
+        self.cache.write().unwrap().insert(key, output.clone());
         Ok(output)
     }
 }
@@ -184,7 +223,7 @@ mod tests {
 
     #[test]
     fn compiles_default_profile_with_all_sections() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let out = engine.compile("default", &vars()).expect("compile failed");
         for title in ["身份与产品信息", "安全与拒绝处理", "工具使用", "语气与格式"]
         {
@@ -197,7 +236,7 @@ mod tests {
 
     #[test]
     fn variables_are_replaced() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let out = engine.compile("default", &vars()).expect("compile failed");
         assert!(
             !out.contains("{{tools}}"),
@@ -215,7 +254,7 @@ mod tests {
 
     #[test]
     fn cache_hit_does_not_rebuild() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let v = vars();
         let first = engine.compile("default", &v).expect("compile failed");
         let count_after_first = engine.compile_count();
@@ -232,7 +271,7 @@ mod tests {
 
     #[test]
     fn different_vars_invalidate_cache() {
-        let mut engine = PromptEngine::new(profiles_root());
+        let engine = PromptEngine::new(profiles_root());
         let v1 = vars();
         let mut v2 = vars();
         v2.insert("cwd", "/other/workspace".to_string());

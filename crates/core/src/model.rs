@@ -69,3 +69,13 @@ pub enum SafetyLevel {
     Confirm,
     Allow,
 }
+
+impl std::fmt::Display for SafetyLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SafetyLevel::Critical => write!(f, "critical"),
+            SafetyLevel::Confirm => write!(f, "confirm"),
+            SafetyLevel::Allow => write!(f, "allow"),
+        }
+    }
+}

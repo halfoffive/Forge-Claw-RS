@@ -20,7 +20,7 @@ use forgeclaw_llm::{
     ToolCallDto, ToolSpec,
 };
 use forgeclaw_tools::{
-    auto_confirm, FileReadTool, FileWriteTool, GrepTool, Sandbox, SearchTool, ShellTool, Tool,
+    FileReadTool, FileWriteTool, GrepTool, Sandbox, SearchTool, ShellTool, Tool,
 };
 use futures::StreamExt;
 use serde::Serialize;
@@ -50,9 +50,9 @@ pub enum OrchestratorEvent {
     /// 文本增量。
     Delta { text: String },
     /// 工具调用开始（已聚合完整 input）。
-    ToolCallStart { name: String, input: Value },
+    ToolCallStart { id: String, name: String, input: Value },
     /// 工具调用结果。
-    ToolResult { name: String, result: ToolResult },
+    ToolResult { id: String, name: String, result: ToolResult },
     /// 一轮对话完成（最终助手文本 + 本轮所有工具调用记录）。
     Complete {
         text: String,
@@ -77,7 +77,7 @@ pub struct Orchestrator {
     llm: Arc<dyn LlmClient>,
     sandbox: Arc<Sandbox>,
     tool_specs: Arc<Vec<ToolSpec>>,
-    prompt_engine: tokio::sync::Mutex<forgeclaw_core::prompt::PromptEngine>,
+    prompt_engine: Arc<forgeclaw_core::prompt::PromptEngine>,
     working_dir: PathBuf,
     model: String,
     profile: String,
@@ -97,9 +97,7 @@ impl Orchestrator {
             llm,
             sandbox,
             tool_specs: Arc::new(tool_specs),
-            prompt_engine: tokio::sync::Mutex::new(forgeclaw_core::prompt::PromptEngine::new(
-                prompts_root,
-            )),
+            prompt_engine: Arc::new(forgeclaw_core::prompt::PromptEngine::new(prompts_root)),
             working_dir,
             model,
             profile,
@@ -118,17 +116,28 @@ impl Orchestrator {
 
     /// 编译 system prompt（注入 tools/model/cwd 变量）。
     pub async fn compile_prompt(&self, profile: &str) -> anyhow::Result<String> {
-        let mut engine = self.prompt_engine.lock().await;
+        let engine = self.prompt_engine.clone();
+        let profile = profile.to_string();
         let vars = self.prompt_vars();
-        let prompt = engine.compile(profile, &vars)?;
+        let prompt = tokio::task::spawn_blocking(move || engine.compile(&profile, &vars)).await??;
         Ok(prompt)
     }
 
     /// 列出 profile 启用的 sections。
     pub async fn list_sections(&self, profile: &str) -> anyhow::Result<Vec<Section>> {
-        let engine = self.prompt_engine.lock().await;
-        let sections = engine.list_sections(profile)?;
+        let engine = self.prompt_engine.clone();
+        let profile = profile.to_string();
+        let sections =
+            tokio::task::spawn_blocking(move || engine.list_sections(&profile)).await??;
         Ok(sections)
+    }
+
+    /// 保存 profile 的 sections 并刷新本地缓存。
+    pub async fn save_sections(&self, profile: &str, sections: Vec<Section>) -> anyhow::Result<()> {
+        let engine = self.prompt_engine.clone();
+        let profile = profile.to_string();
+        tokio::task::spawn_blocking(move || engine.save_sections(&profile, sections)).await??;
+        Ok(())
     }
 
     fn prompt_vars(&self) -> HashMap<&'static str, String> {
@@ -146,9 +155,10 @@ impl Orchestrator {
     }
 
     async fn compile_system_prompt(&self) -> anyhow::Result<String> {
-        let mut engine = self.prompt_engine.lock().await;
+        let engine = self.prompt_engine.clone();
+        let profile = self.profile.clone();
         let vars = self.prompt_vars();
-        let prompt = engine.compile(&self.profile, &vars)?;
+        let prompt = tokio::task::spawn_blocking(move || engine.compile(&profile, &vars)).await??;
         Ok(prompt)
     }
 
@@ -372,6 +382,7 @@ impl Orchestrator {
                         if let Some(tx) = tx {
                             if tx
                                 .send(OrchestratorEvent::ToolCallStart {
+                                    id: agg.id.clone(),
                                     name: agg.name.clone(),
                                     input: v.clone(),
                                 })
@@ -397,6 +408,7 @@ impl Orchestrator {
                         if let Some(tx) = tx {
                             if tx
                                 .send(OrchestratorEvent::ToolCallStart {
+                                    id: agg.id.clone(),
                                     name: agg.name.clone(),
                                     input: Value::Null,
                                 })
@@ -418,6 +430,7 @@ impl Orchestrator {
                 if let Some(tx) = tx {
                     if tx
                         .send(OrchestratorEvent::ToolResult {
+                            id: agg.id.clone(),
                             name: agg.name.clone(),
                             result: result.clone(),
                         })
@@ -511,6 +524,20 @@ fn spec_for(tool: &dyn Tool, description: &str) -> ToolSpec {
     }
 }
 
+/// Server 模式下的确认回调。
+///
+/// 当前没有配置用户确认通道，因此保守地拒绝所有 `Confirm` 级工具调用，
+/// 确保 `FileWriteTool` 等不会在没有用户审批的情况下自动执行。
+fn server_confirmer() -> forgeclaw_tools::Confirmer {
+    Box::new(|name: &str, _input: &Value| {
+        warn!(
+            tool = %name,
+            "server mode: Confirm-level tool denied; user approval not configured"
+        );
+        false
+    })
+}
+
 /// 装配默认沙箱（5 工具：shell/read/write/search/grep）+ 对应 ToolSpec 清单。
 /// 因 `Sandbox` 不暴露工具 schema，须在注册前从工具实例抽出。
 pub fn default_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<ToolSpec>) {
@@ -534,7 +561,7 @@ pub fn default_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<ToolSpe
         ),
     ];
 
-    let mut sb = Sandbox::new(working_dir, auto_confirm());
+    let mut sb = Sandbox::new(working_dir, server_confirmer());
     sb.register(Box::new(shell));
     sb.register(Box::new(read));
     sb.register(Box::new(write));
@@ -562,9 +589,69 @@ pub fn restricted_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<Tool
         ),
     ];
 
-    let mut sb = Sandbox::new(working_dir, auto_confirm());
+    let mut sb = Sandbox::new(working_dir, server_confirmer());
     sb.register(Box::new(read));
     sb.register(Box::new(search));
     sb.register(Box::new(grep));
     (sb, specs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgeclaw_tools::auto_confirm;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn server_default_sandbox_blocks_write_without_user_approval() {
+        // Server 模式下 Confirm 级工具应被拒绝，FileWriteTool 不能自动执行。
+        let dir = tempdir().unwrap();
+        let (sb, _specs) = default_sandbox_with_specs(dir.path().to_path_buf());
+
+        let target = dir.path().join("should_not_exist.txt");
+        let r = sb
+            .execute(
+                "write",
+                json!({"path": "should_not_exist.txt", "content": "x"}),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            r.error.as_deref().unwrap().contains("blocked"),
+            "expected blocked error, got {:?}",
+            r.error
+        );
+        assert!(!target.exists(), "write should not have created the file");
+    }
+
+    #[tokio::test]
+    async fn server_default_sandbox_allows_read_tool() {
+        // Allow 级工具不受确认回调影响，应继续正常工作。
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let (sb, _specs) = default_sandbox_with_specs(dir.path().to_path_buf());
+
+        let r = sb.execute("read", json!({"path": "a.txt"})).await.unwrap();
+        assert_eq!(r.output, "hello");
+        assert!(r.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_direct_mode_auto_confirm_allows_write() {
+        // CLI 直接模式保留原有 auto_confirm 行为：Confirm 级工具被放行。
+        let dir = tempdir().unwrap();
+        let mut sb = Sandbox::new(dir.path().to_path_buf(), auto_confirm());
+        sb.register(Box::new(FileWriteTool::new(dir.path().to_path_buf())));
+
+        let r = sb
+            .execute("write", json!({"path": "out.txt", "content": "ok"}))
+            .await
+            .unwrap();
+
+        assert!(r.error.is_none(), "expected success, got {:?}", r.error);
+        let written = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
+        assert_eq!(written, "ok");
+    }
 }

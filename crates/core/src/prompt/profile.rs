@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
@@ -29,14 +29,14 @@ pub struct Profile {
     pub sections: Vec<(String, PathBuf)>,
 }
 
-/// TOML 文件镜像结构（仅用于反序列化）。
-#[derive(Debug, Deserialize)]
+/// TOML 文件镜像结构（用于反序列化与序列化）。
+#[derive(Debug, Deserialize, Serialize)]
 struct ProfileFile {
     profile: ProfileMeta,
     sections: HashMap<String, PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ProfileMeta {
     name: String,
     model_hint: String,
@@ -56,6 +56,23 @@ pub fn parse_profile(text: &str) -> Result<Profile> {
 pub fn load_profile(path: impl AsRef<Path>) -> Result<Profile> {
     let text = std::fs::read_to_string(path.as_ref())?;
     parse_profile(&text)
+}
+
+/// 将 Profile 写回 TOML 文件。
+pub fn save_profile(path: impl AsRef<Path>, profile: &Profile) -> Result<()> {
+    let sections: HashMap<String, PathBuf> =
+        profile.sections.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let file = ProfileFile {
+        profile: ProfileMeta {
+            name: profile.name.clone(),
+            model_hint: profile.model_hint.clone(),
+        },
+        sections,
+    };
+    let text =
+        toml::to_string_pretty(&file).map_err(|e| crate::error::CoreError::TomlSerialize(e.to_string()))?;
+    std::fs::write(path.as_ref(), text)?;
+    Ok(())
 }
 
 #[cfg(test)]

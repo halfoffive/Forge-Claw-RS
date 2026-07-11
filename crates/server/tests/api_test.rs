@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{HeaderValue, Request, StatusCode};
-use forgeclaw_core::model::Session;
+use forgeclaw_core::model::{Message, Session};
 use forgeclaw_llm::{ChatRequest, Event, History, LlmClient, Role};
 use forgeclaw_server::{app, AppState, Orchestrator, SessionData, UserStore};
 use futures::stream::BoxStream;
@@ -297,6 +297,77 @@ async fn parallel_chat_requests_same_session_preserve_history() {
         2,
         "both assistant messages should be preserved"
     );
+}
+
+#[tokio::test]
+async fn concurrent_chat_creates_single_session_without_message_loss() {
+    // 同一不存在的 session_id 被两个并发 /api/chat 请求首次创建时，
+    // entry/or_insert_with 保证只生成一个 SessionData，两条用户消息都保留。
+    let (state, _dir) = build_state();
+    let session_id = Uuid::new_v4();
+
+    let body1 =
+        serde_json::to_vec(&json!({"message":"msg1","session_id":session_id.to_string()})).unwrap();
+    let body2 =
+        serde_json::to_vec(&json!({"message":"msg2","session_id":session_id.to_string()})).unwrap();
+
+    let app = app(state.clone());
+    let fut1 = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/chat")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::from(body1))
+            .unwrap(),
+    );
+    let fut2 = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/chat")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::from(body2))
+            .unwrap(),
+    );
+
+    let (r1, r2) = tokio::join!(fut1, fut2);
+    assert_eq!(r1.unwrap().status(), StatusCode::OK);
+    assert_eq!(r2.unwrap().status(), StatusCode::OK);
+
+    let sessions = state.sessions.read().await;
+    assert_eq!(sessions.len(), 1, "只应创建一个 session");
+    let data = sessions.get(&session_id).expect("session exists");
+
+    let history = data.history.read().await;
+    let user_msgs: Vec<_> = history
+        .messages()
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .collect();
+    let assistant_msgs: Vec<_> = history
+        .messages()
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .collect();
+    assert_eq!(user_msgs.len(), 2, "history 应保留两条 user 消息");
+    assert_eq!(assistant_msgs.len(), 2, "history 应保留两条 assistant 消息");
+
+    // session.messages 与 history 状态一致
+    let session_user_msgs: Vec<_> = data
+        .session
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::User(_)))
+        .collect();
+    let session_assistant_msgs: Vec<_> = data
+        .session
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::Assistant(_)))
+        .collect();
+    assert_eq!(session_user_msgs.len(), 2);
+    assert_eq!(session_assistant_msgs.len(), 2);
 }
 
 #[tokio::test]

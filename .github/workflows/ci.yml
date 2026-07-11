@@ -44,6 +44,12 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      - name: Lint
+        run: pnpm lint
+
+      - name: Audit dependencies
+        run: pnpm audit
+
       - name: Upload web dist
         uses: actions/upload-artifact@v7
         with:
@@ -78,5 +84,42 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit
+
       - name: Test
         run: cargo test --workspace
+
+  rust-cross-platform:
+    needs: frontend
+    if: github.event_name == 'pull_request'
+    name: Cross-platform build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download web dist
+        uses: actions/download-artifact@v5
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-cross-platform
+
+      - name: Build workspace
+        run: cargo build --workspace

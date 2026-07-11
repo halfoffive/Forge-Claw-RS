@@ -28,13 +28,13 @@
 
 ### 阶段 1：阻断性 P0（4 条，最高优先）
 
-- [ ] Task 9: [C-004] [NOT-FIXED] [首轮 Task 13] ShellTool `env_clear()` 清理敏感环境变量
+- [x] Task 9: [C-004] [NOT-FIXED] [首轮 Task 13] ShellTool `env_clear()` 清理敏感环境变量
   - 修复目标：`crates/tools/src/shell.rs` 中 `Command::new("sh")` 调用 `.env_clear()` 后仅注入 allowlist（`PATH`、`HOME`、必要的 `TERM`）；新增测试验证 `printenv FORGECLAW_USERS` / `printenv DEEPSEEK_API_KEY` 返回空，`printenv PATH` 非空
   - 受影响：`crates/tools/src/shell.rs`
   - 可并行：是（独立文件，与 Task 10/11/12 互不冲突）
   - 状态来源：NOT-FIXED（首轮 P0，be8ac66 未触及）
 
-- [ ] Task 10: [C-001] [PARTIAL] [首轮 Task 17] ShellTool 黑名单补全
+- [x] Task 10: [C-001] [PARTIAL] [首轮 Task 17] ShellTool 黑名单补全
   - 修复目标：`crates/tools/src/shell.rs:38-64` 黑名单补全 `sudo`/`su`/`chown`/`chmod 777`（无 -R）/`cat /etc/passwd`/`cat ~/.ssh`/`env`/`mv`/`cp` 写 `/etc/`/`bash -i >& /dev/tcp`/`nc`/`mkfifo`/`curl|sh`/`wget|bash`；新增测试覆盖每个新增绕过用例均被拦截
   - 受影响：`crates/tools/src/shell.rs`
   - 可并行：是（与 Task 9 同文件但不同代码块，建议合并到同一变更）
@@ -46,7 +46,7 @@
   - 可并行：是（长期任务，可拆独立变更）
   - 状态来源：NOT-FIXED（首轮 P0，未引入任何沙箱 crate）
 
-- [ ] Task 12: [F-001/F-NEW-001] [PARTIAL+NEW] [首轮 Task 11] 本地 `cargo check` 失败修复
+- [x] Task 12: [F-001/F-NEW-001] [PARTIAL+NEW] [首轮 Task 11] 本地 `cargo check` 失败修复
   - 修复目标：`web/dist` 目录在仓库中可被 rust-embed 编译期读取。方案择一：① `web/dist/.gitkeep` 占位 + `web/.gitignore` 改 `dist/*` + `!dist/.gitkeep`；② `crates/server/build.rs` 在 dist 不存在时创建空目录。验证：干净克隆后 `cargo check -p forgeclaw-server` 无需先 `pnpm build` 即通过
   - 受影响：`web/.gitignore`、`web/dist/.gitkeep`（新增）或 `crates/server/build.rs`
   - 可并行：是（最小改动，建议最先做以解除本地编译阻断）
@@ -60,7 +60,7 @@
   - 可并行：是
   - 状态来源：REGRESSED（be8ac66 显式回退 model.rs 到 main 版本）
 
-- [ ] Task 14: [B-NEW-001] [NEW] 新建 session 并发竞态修复
+- [x] Task 14: [B-NEW-001] [NEW] 新建 session 并发竞态修复
   - 修复目标：`crates/server/src/api.rs:172-181` 与 `ws.rs:172-188` 的"session 不存在时各自创建 history_arc"改为 `sessions.write().entry(session_id).or_insert_with(|| ...)` 原子"取或建"；新增并发测试：两请求同时用同一不存在 session_id，最终 history 与 session.messages 状态一致
   - 受影响：`crates/server/src/api.rs`、`crates/server/src/ws.rs`
   - 可并行：否（与 Task 15 联动，建议合并到同一变更）
@@ -78,7 +78,7 @@
   - 可并行：是
   - 状态来源：REGRESSED（be8ac66 删除 3 个测试，2 个高风险路径无替代守护）
 
-- [ ] Task 17: [C-017] [NOT-FIXED] 去除 server 模式 `auto_confirm()`
+- [x] Task 17: [C-017] [NOT-FIXED] 去除 server 模式 `auto_confirm()`
   - 修复目标：`crates/server/src/orchestrator.rs:537,565` 的 `default_sandbox_with_specs`/`restricted_sandbox_with_specs` 不再用 `auto_confirm()`；Confirm 级工具（含 `FileWriteTool`）需显式确认或按配置策略放行；新增测试验证 server 模式下 FileWriteTool 不被自动放行
   - 受影响：`crates/server/src/orchestrator.rs`
   - 可并行：是
@@ -92,13 +92,13 @@
 
 ### 阶段 3：安全加固 P1（5 条）
 
-- [ ] Task 19: [C-015] [NOT-FIXED] FileWriteTool TOCTOU 修复
+- [x] Task 19: [C-015] [NOT-FIXED] FileWriteTool TOCTOU 修复
   - 修复目标：`crates/tools/src/file.rs:213-241` 的 `is_within` canonicalize 与 `fs::write` 之间 TOCTOU 消除：canonicalize 后直接写规范化路径（不再 re-resolve），或在写锁内完成检查+写入；新增测试验证符号链接替换逃逸被拒
   - 受影响：`crates/tools/src/file.rs`
   - 可并行：是
   - 状态来源：NOT-FIXED（首轮 P1，未触及）
 
-- [ ] Task 20: [C-010/C-020] [PARTIAL+NOT-FIXED] [首轮 Task 29] `find_by_token` 常量时间查找
+- [x] Task 20: [C-010/C-020] [PARTIAL+NOT-FIXED] [首轮 Task 29] `find_by_token` 常量时间查找
   - 修复目标：`crates/server/src/auth.rs:99-101` 的 `find_by_token` 改常量时间查找（遍历全部用户对每条 token 做 `subtle::ConstantTimeEq`，不短路）；新增测试验证不存在 token 与存在 token 的查找时间无显著差异
   - 受影响：`crates/server/src/auth.rs`
   - 可并行：是
@@ -130,7 +130,7 @@
   - 可并行：是
   - 状态来源：PARTIAL（已封装超时与 401 处理，缺重试）
 
-- [ ] Task 25: [E-NEW-001] [NEW] tool_result 精确关联（后端加 `call_id`）
+- [x] Task 25: [E-NEW-001] [NEW] tool_result 精确关联（后端加 `call_id`）
   - 修复目标：`crates/server/src/orchestrator.rs` 的 `tool_call_start` 事件增加 `call_id` 字段（取自 LLM 返回的 tool_call.id）；`crates/llm/src/lib.rs` 的 ToolCall 序列化保留 id；`web/src/views/ChatView.vue:142-156` 的 tool_result 回填改按 `call_id` 匹配；新增测试验证并发同名工具调用结果回填正确
   - 受影响：`crates/server/src/orchestrator.rs`、`crates/llm/src/lib.rs`、`web/src/views/ChatView.vue`、`web/src/api/types.ts`
   - 可并行：否（跨前后端，需协调）

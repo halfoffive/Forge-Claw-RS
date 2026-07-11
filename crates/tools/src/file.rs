@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 
 use crate::Tool;
 
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt;
+
 /// 判断 `path` 是否位于 `base` 目录内（含 `base` 自身）。
 ///
 /// 通过 `std::fs::canonicalize` 解析符号链接与 `..`，因此对逃逸场景安全。
@@ -34,7 +37,7 @@ pub fn is_within(path: &Path, base: &Path) -> bool {
             }
         }
     };
-    canon_path.starts_with(&canon_base)
+    canon_path.strip_prefix(&canon_base).is_ok()
 }
 
 /// 判断路径是否落在敏感目录（即使在 working_dir 内也拒绝写入）。
@@ -100,6 +103,43 @@ fn blocked(reason: &str) -> ToolResult {
         error: Some(format!("blocked: {}", reason)),
         duration_ms: 0,
     }
+}
+
+/// 将写入目标规范化到其所在目录的真实路径，但不解析目标文件自身的符号链接。
+///
+/// 对不存在的文件会规范化其父目录后拼接文件名返回，因此调用方必须再配合
+/// `O_NOFOLLOW` 等机制防止目标在打开前被替换为符号链接。
+fn canonical_target_for_write(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let name = path.file_name()?;
+    let canon_parent = parent.canonicalize().ok()?;
+    Some(canon_parent.join(name))
+}
+
+/// 安全写入：Unix 下先规范化父目录，再用 `O_NOFOLLOW` 打开目标并写入，
+/// 防止 `is_within` 检查与打开文件之间目标被替换为外部符号链接。
+#[cfg(unix)]
+async fn write_with_nofollow(path: &Path, content: &str) -> std::io::Result<()> {
+    let target = canonical_target_for_write(path).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "cannot canonicalize target path")
+    })?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&target)
+        .await?;
+    file.write_all(content.as_bytes()).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn write_with_nofollow(path: &Path, content: &str) -> std::io::Result<()> {
+    let target = canonical_target_for_write(path).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "cannot canonicalize target path")
+    })?;
+    tokio::fs::write(&target, content).await
 }
 
 /// 读取工作目录内文件内容。
@@ -227,7 +267,7 @@ impl Tool for FileWriteTool {
             return Ok(blocked("path outside working directory"));
         }
         let start = std::time::Instant::now();
-        match tokio::fs::write(&path, content).await {
+        match write_with_nofollow(&path, content).await {
             Ok(()) => Ok(ToolResult {
                 output: format!("wrote {} bytes to {}", content.len(), path.display()),
                 error: None,
@@ -370,5 +410,44 @@ mod tests {
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         let lvl = tool.check(&json!({"path": "ok.txt", "content": "y"})).await;
         assert_eq!(lvl, SafetyLevel::Confirm);
+    }
+
+    #[test]
+    fn is_within_prefix_mismatch() {
+        let base = tempdir().unwrap();
+        let foo = base.path().join("foo");
+        let foobar = base.path().join("foobar");
+        let foo_bar = foo.join("bar");
+        std::fs::create_dir_all(&foo).unwrap();
+        std::fs::create_dir_all(&foobar).unwrap();
+        // /tmp/foobar 不应被视为在 /tmp/foo 内
+        assert!(!is_within(&foobar, &foo));
+        // /tmp/foo/bar 仍在 /tmp/foo 内
+        assert!(is_within(&foo_bar, &foo));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_blocks_symlink_replacement_toctou() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let target = base.path().join("target.txt");
+
+        // 1. 目标文件在 base 内，is_within 检查通过
+        std::fs::write(&target, "original").unwrap();
+        assert!(is_within(&target, base.path()));
+
+        // 2. 在 is_within 通过后把目标替换为指向工作目录外的符号链接
+        std::fs::remove_file(&target).unwrap();
+        let outside_file = outside.path().join("stolen.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        symlink(&outside_file, &target).unwrap();
+
+        // 3. 写入必须失败，且不能写到外部文件
+        let result = write_with_nofollow(&target, "malicious").await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "outside");
     }
 }

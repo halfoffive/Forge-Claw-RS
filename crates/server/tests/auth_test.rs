@@ -332,22 +332,25 @@ async fn isolation_alice_get_own_session_returns_200() {
 // ============ WebSocket 一次性 ticket 鉴权（升级前 401） ============
 
 /// 构造一个 WS 升级请求（带必要头）。
-fn ws_request(uri: &str) -> Request<Body> {
-    Request::builder()
+/// `protocol` 作为 `Sec-WebSocket-Protocol` 头发送，如 `forgeclaw, <ticket>`。
+fn ws_request(uri: &str, protocol: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
         .method("GET")
         .uri(uri)
         .header("upgrade", "websocket")
         .header("connection", "upgrade")
         .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(Body::empty())
-        .unwrap()
+        .header("sec-websocket-version", "13");
+    if let Some(p) = protocol {
+        builder = builder.header("sec-websocket-protocol", p);
+    }
+    builder.body(Body::empty()).unwrap()
 }
 
 #[tokio::test]
 async fn ws_without_ticket_returns_401() {
     let (state, _dir) = build_state();
-    let response = app(state).oneshot(ws_request("/ws/chat")).await.unwrap();
+    let response = app(state).oneshot(ws_request("/ws/chat", None)).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -355,7 +358,7 @@ async fn ws_without_ticket_returns_401() {
 async fn ws_with_wrong_ticket_returns_401() {
     let (state, _dir) = build_state();
     let response = app(state)
-        .oneshot(ws_request("/ws/chat?ticket=wrong-ticket"))
+        .oneshot(ws_request("/ws/chat", Some("forgeclaw, wrong-ticket")))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -367,11 +370,14 @@ async fn ws_with_valid_ticket_passes_auth() {
     let alice = state.user_store.find_by_name("alice").expect("user exists");
     let ticket = state.issue_ticket(alice.id);
     let response = app(state)
-        .oneshot(ws_request(&format!("/ws/chat?ticket={ticket}")))
+        .oneshot(ws_request("/ws/chat", Some(&format!("forgeclaw, {ticket}"))))
         .await
         .unwrap();
     // 有效 ticket 通过鉴权后，oneshot 无真实 hyper 连接 → WebSocketUpgrade 返回 426
     // （ConnectionNotUpgradable）。关键：不是 401，证明 ticket 校验已通过。
     assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    // 在 oneshot 测试环境下无法获得真实 101 响应，故不在这里断言
+    // `Sec-WebSocket-Protocol` 头；后端 `ws_chat_handler` 已设置
+    // `protocols(["forgeclaw"])`，确保真实升级时只返回子协议名 forgeclaw。
 }

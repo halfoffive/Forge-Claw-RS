@@ -77,36 +77,75 @@ async function send(): Promise<void> {
   }
 
   try {
-    const ticket = await getWsTicket(auth.token)
-    const url = buildWsUrl(ticket)
-    ws = new WebSocket(url)
+    await connectWithRetry(payload, assistantIdx)
   } catch (e) {
     // 清理已追加的用户消息与占位 assistant 消息，避免状态污染。
-    session.popMessage()
+    session.popMessages(2)
     status.value = 'error'
-    errorMsg.value = e instanceof ApiError ? e.message : '获取 WS ticket 失败'
+    errorMsg.value =
+      e instanceof ApiError
+        ? e.message
+        : e instanceof Error
+          ? e.message
+          : '连接失败'
     sending.value = false
-    return
   }
+}
 
-  ws.onopen = () => {
-    status.value = 'streaming'
-    ws?.send(JSON.stringify(payload))
-  }
-  ws.onmessage = (ev) => onFrame(ev.data as string, assistantIdx)
-  ws.onerror = () => {
-    status.value = 'error'
-    errorMsg.value = 'WebSocket 连接错误'
-  }
-  ws.onclose = () => {
-    // F-08: 区分正常/异常关闭。streaming 中被服务端断开视为异常。
-    if (status.value === 'streaming') {
-      errorMsg.value = '连接中断，回复可能不完整'
+const MAX_RETRIES = 3
+const BASE_DELAY_MS = 500
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function connectWithRetry(
+  payload: WsChatRequest,
+  assistantIdx: number,
+  attempt = 0,
+): Promise<void> {
+  try {
+    const ticket = await getWsTicket(auth.token!)
+    const url = buildWsUrl()
+    cleanupWs()
+    ws = new WebSocket(url, ['forgeclaw', ticket])
+    await new Promise<void>((resolve, reject) => {
+      ws!.onopen = () => {
+        status.value = 'streaming'
+        errorMsg.value = ''
+        ws!.send(JSON.stringify(payload))
+        resolve()
+      }
+      ws!.onerror = () => reject(new Error('WebSocket 连接错误'))
+      ws!.onclose = () => reject(new Error('WebSocket 已关闭'))
+    })
+    // 连接成功后设置长期处理器。
+    ws!.onmessage = (ev) => onFrame(ev.data as string, assistantIdx)
+    ws!.onerror = () => {
+      errorMsg.value = 'WebSocket 连接错误'
+      status.value = 'error'
+      const count = session.currentMessages.length - assistantIdx
+      if (count > 0) session.popMessages(count)
+      sending.value = false
+      cleanupWs()
     }
-    if (status.value !== 'error') {
-      status.value = 'idle'
+    ws!.onclose = () => {
+      // F-08: 区分正常/异常关闭。streaming 中被服务端断开视为异常。
+      if (status.value === 'streaming') {
+        errorMsg.value = '连接中断，回复可能不完整'
+        status.value = 'error'
+      } else if (status.value !== 'error') {
+        status.value = 'idle'
+      }
+      sending.value = false
+      cleanupWs()
     }
-    sending.value = false
+  } catch (e) {
+    if (attempt < MAX_RETRIES) {
+      await delay(BASE_DELAY_MS * 2 ** attempt)
+      return connectWithRetry(payload, assistantIdx, attempt + 1)
+    }
+    throw e
   }
 }
 
@@ -128,9 +167,9 @@ function onFrame(raw: string, assistantIdx: number): void {
       break
     }
     case 'tool_call_start': {
-      // F-01: ToolCall 字段对齐后端 { id, tool, input }。
+      // E-NEW-001: 使用后端下发的工具调用 id，保证同一工具连续调用时结果不串位。
       const call: ToolCall = {
-        id: crypto.randomUUID(),
+        id: event.id,
         tool: event.name,
         input: event.input,
       }
@@ -140,16 +179,13 @@ function onFrame(raw: string, assistantIdx: number): void {
       break
     }
     case 'tool_result': {
-      // 回填最近一个同名且 result 为空的 Tool 消息。
+      // E-NEW-001: 按 id 精确回填结果。
       const result: ToolResult = event.result
       for (let i = session.currentMessages.length - 1; i >= 0; i--) {
         const m = session.currentMessages[i]
-        if ('Tool' in m && m.Tool[0].tool === event.name) {
-          const [, prev] = m.Tool
-          if (!prev.output && !prev.error) {
-            m.Tool[1] = result
-            break
-          }
+        if ('Tool' in m && m.Tool[0].id === event.id) {
+          m.Tool[1] = result
+          break
         }
       }
       break
@@ -354,7 +390,7 @@ function onEnter(e: KeyboardEvent): void {
 }
 .msg.user .bubble {
   background: var(--color-primary);
-  color: #fff;
+  color: var(--color-on-primary);
 }
 .msg.assistant .bubble {
   background: var(--color-surface);
@@ -434,14 +470,16 @@ function onEnter(e: KeyboardEvent): void {
   border-radius: var(--radius);
   outline: none;
 }
-.input:focus {
+.input:focus-visible {
   border-color: var(--color-primary);
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
 }
 .send {
   padding: 0 18px;
   font-size: 14px;
   font-weight: 500;
-  color: #fff;
+  color: var(--color-on-primary);
   background: var(--color-primary);
   border: none;
   border-radius: var(--radius);
@@ -450,5 +488,27 @@ function onEnter(e: KeyboardEvent): void {
 .send:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+@media (max-width: 640px) {
+  .bubble {
+    max-width: 95%;
+  }
+  .tool-card {
+    max-width: 95%;
+  }
+  .composer {
+    padding: 12px;
+  }
+  .messages {
+    padding: 12px;
+  }
 }
 </style>

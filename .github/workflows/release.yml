@@ -5,9 +5,6 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -17,6 +14,8 @@ jobs:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +74,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.os }}-${{ matrix.target }}
 
       - name: Install cross
         if: matrix.use-cross
@@ -111,7 +110,5 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            forgeclaw-cli-${{ matrix.target }}.tar.gz
-            forgeclaw-cli-${{ matrix.target }}.tar.gz.sha256
-            forgeclaw-cli-${{ matrix.target }}.zip
-            forgeclaw-cli-${{ matrix.target }}.zip.sha256
+            forgeclaw-cli-${{ matrix.target }}.${{ matrix.archive }}
+            forgeclaw-cli-${{ matrix.target }}.${{ matrix.archive }}.sha256

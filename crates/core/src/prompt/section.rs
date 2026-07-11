@@ -125,6 +125,19 @@ pub fn load_section_file(path: impl AsRef<Path>) -> Result<Section> {
     parse_section(&text)
 }
 
+/// 将 Section 序列化为带 YAML frontmatter 的 Markdown 文本。
+pub fn serialize_section(section: &Section) -> String {
+    format!(
+        "---\nid: {}\ntitle: \"{}\"\nlevel: {}\nenabled: {}\norder: {}\n---\n\n{}",
+        section.id,
+        section.title,
+        section.level,
+        section.enabled,
+        section.order,
+        section.body
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -268,11 +268,11 @@ fn print_stream_event(ev: &OrchestratorEvent) {
             print!("{CYAN}{text}{RESET}");
             let _ = io::stdout().flush();
         }
-        OrchestratorEvent::ToolCallStart { name, input } => {
+        OrchestratorEvent::ToolCallStart { id: _, name, input } => {
             println!("\n{YELLOW}[tool] {name}: {input}{RESET}");
             let _ = io::stdout().flush();
         }
-        OrchestratorEvent::ToolResult { name, result } => {
+        OrchestratorEvent::ToolResult { id: _, name, result } => {
             if let Some(err) = &result.error {
                 println!("{RED}[result] {name}: error: {err}{RESET}");
             } else {
@@ -323,9 +323,10 @@ pub async fn run_run(cfg: Config, task: String, auto_apply: bool) -> anyhow::Res
 // ============ prompt ============
 
 pub async fn run_prompt_compile(cfg: Config, profile: String) -> anyhow::Result<()> {
-    let mut engine = PromptEngine::new(cfg.prompts_root.clone());
+    let engine = PromptEngine::new(cfg.prompts_root.clone());
     let vars = prompt_vars(&cfg);
-    let prompt = engine.compile(&profile, &vars)?;
+    let prompt =
+        tokio::task::spawn_blocking(move || engine.compile(&profile, &vars)).await??;
     print!("{prompt}");
     if !prompt.ends_with('\n') {
         println!();

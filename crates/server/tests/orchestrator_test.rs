@@ -4,6 +4,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use forgeclaw_llm::{ChatRequest, Event, History, LlmClient, Role};
@@ -429,4 +430,86 @@ async fn compile_prompt_with_real_profiles_succeeds() {
     assert!(prompt.contains("## 身份与产品信息"));
     assert!(prompt.contains("deepseek-chat"));
     assert!(prompt.contains("read"));
+}
+
+#[tokio::test]
+async fn run_streaming_stops_when_receiver_dropped() {
+    // D-006/B-003：receiver 被 drop 后 run_streaming 应立即返回，不无限阻塞。
+    let scripts = vec![vec![
+        Event::Delta("a".into()),
+        Event::Delta("b".into()),
+        Event::Delta("c".into()),
+        Event::Done,
+    ]];
+    let (orch, _dir) = build_orch(scripts);
+    let mut history = History::with_system("sys");
+    let (tx, rx) = mpsc::channel::<OrchestratorEvent>(64);
+    let orch_arc = Arc::new(orch);
+    let handle = {
+        let orch = orch_arc.clone();
+        tokio::spawn(async move { orch.run_streaming(&mut history, "go".into(), tx).await })
+    };
+
+    drop(rx);
+    let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("run_streaming should not block after receiver dropped")
+        .unwrap();
+    assert!(result.is_ok(), "expected run_streaming to return Ok, got {:?}", result);
+}
+
+#[tokio::test]
+async fn run_once_propagates_llm_stream_error() {
+    // D-004：LLM 流内错误应被传播为 OrchestratorEvent::Error，且 history 不变。
+    let (orch, _dir) = build_orch(vec![vec![Event::Error("llm stream error".into())]]);
+    let mut history = History::with_system("sys");
+    let event = orch.run_once(&mut history, "x".into()).await.unwrap();
+    match event {
+        OrchestratorEvent::Error { message } => {
+            assert_eq!(message, "llm stream error");
+        }
+        other => panic!("expected Error event, got {:?}", other),
+    }
+    // 错误路径不修改 history，仅保留初始 system。
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.messages()[0].role, Role::System);
+}
+
+#[tokio::test]
+async fn run_once_invalid_tool_arguments_returns_tool_result_error() {
+    // D-012：工具参数 JSON 解析失败时构造错误 ToolResult 回填。
+    let scripts = vec![
+        vec![Event::ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("read".into()),
+            arguments: Some("not valid json".into()),
+        }],
+        vec![Event::Delta("ok".into()), Event::Done],
+    ];
+    let (orch, _dir) = build_orch(scripts);
+    let mut history = History::with_system("sys");
+    let event = orch.run_once(&mut history, "x".into()).await.unwrap();
+    match event {
+        OrchestratorEvent::Complete { text, tool_calls } => {
+            assert_eq!(text, "ok");
+            assert_eq!(tool_calls.len(), 1);
+            let err = tool_calls[0]
+                .result
+                .error
+                .as_ref()
+                .expect("tool result should contain error");
+            assert!(err.contains("invalid tool input"), "got error: {}", err);
+        }
+        other => panic!("expected Complete event, got {:?}", other),
+    }
+    // system + user + assistant(tool_calls) + tool + assistant("ok") = 5
+    assert_eq!(history.len(), 5);
+    let tool_msg = &history.messages()[3];
+    assert_eq!(tool_msg.role, Role::Tool);
+    assert!(
+        tool_msg.content.contains("invalid tool input"),
+        "tool_msg.content should contain error, got {:?}",
+        tool_msg.content
+    );
 }
