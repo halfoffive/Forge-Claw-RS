@@ -1,8 +1,8 @@
 //! Agent 编排器：LLM 调用 → 工具调度 → 结果回填 → 再调用循环。
 //!
 //! 设计要点：
-//! - [`Orchestrator`] 持有 `Arc<dyn LlmClient>` / `Arc<Sandbox>` 与 tool spec 清单，
-//!   `PromptEngine` 用 `tokio::sync::Mutex` 包裹（其 `compile` 为 `&mut self`）。
+//! - [`Orchestrator`] 持有 `Arc<dyn LlmClient>` / `Arc<Sandbox>` 与 tool spec 清单；
+//!   `PromptEngine` 内部已并发安全（`&self` + 短临界区），无需额外 `Mutex`。
 //! - [`Orchestrator::run_once`] 为同步阻塞语义：跑完一轮或多轮工具循环后返回最终文本。
 //! - [`Orchestrator::run_streaming`] 通过 `tokio::sync::mpsc` 桥接为事件流，供 WebSocket 用。
 //! - [`Orchestrator::dispatch_subagent`] 用受限沙箱（只读工具）+ 角色 system prompt 隔离上下文。
@@ -20,7 +20,7 @@ use forgeclaw_llm::{
     ToolCallDto, ToolSpec,
 };
 use forgeclaw_tools::{
-    auto_confirm, FileReadTool, FileWriteTool, GrepTool, Sandbox, SearchTool, ShellTool, Tool,
+    confirmer_from_fn, FileReadTool, FileWriteTool, GrepTool, Sandbox, SearchTool, ShellTool, Tool,
 };
 use futures::StreamExt;
 use serde::Serialize;
@@ -85,7 +85,7 @@ pub struct Orchestrator {
     llm: Arc<dyn LlmClient>,
     sandbox: Arc<Sandbox>,
     tool_specs: Arc<Vec<ToolSpec>>,
-    prompt_engine: tokio::sync::Mutex<forgeclaw_core::prompt::PromptEngine>,
+    prompt_engine: forgeclaw_core::prompt::PromptEngine,
     working_dir: PathBuf,
     model: String,
     profile: String,
@@ -105,9 +105,7 @@ impl Orchestrator {
             llm,
             sandbox,
             tool_specs: Arc::new(tool_specs),
-            prompt_engine: tokio::sync::Mutex::new(forgeclaw_core::prompt::PromptEngine::new(
-                prompts_root,
-            )),
+            prompt_engine: forgeclaw_core::prompt::PromptEngine::new(prompts_root),
             working_dir,
             model,
             profile,
@@ -126,16 +124,14 @@ impl Orchestrator {
 
     /// 编译 system prompt（注入 tools/model/cwd 变量）。
     pub async fn compile_prompt(&self, profile: &str) -> anyhow::Result<String> {
-        let mut engine = self.prompt_engine.lock().await;
         let vars = self.prompt_vars();
-        let prompt = engine.compile(profile, &vars)?;
+        let prompt = self.prompt_engine.compile(profile, &vars).await?;
         Ok(prompt)
     }
 
     /// 列出 profile 启用的 sections。
     pub async fn list_sections(&self, profile: &str) -> anyhow::Result<Vec<Section>> {
-        let engine = self.prompt_engine.lock().await;
-        let sections = engine.list_sections(profile)?;
+        let sections = self.prompt_engine.list_sections(profile)?;
         Ok(sections)
     }
 
@@ -154,9 +150,8 @@ impl Orchestrator {
     }
 
     async fn compile_system_prompt(&self) -> anyhow::Result<String> {
-        let mut engine = self.prompt_engine.lock().await;
         let vars = self.prompt_vars();
-        let prompt = engine.compile(&self.profile, &vars)?;
+        let prompt = self.prompt_engine.compile(&self.profile, &vars).await?;
         Ok(prompt)
     }
 
@@ -524,6 +519,9 @@ fn spec_for(tool: &dyn Tool, description: &str) -> ToolSpec {
 
 /// 装配默认沙箱（5 工具：shell/read/write/search/grep）+ 对应 ToolSpec 清单。
 /// 因 `Sandbox` 不暴露工具 schema，须在注册前从工具实例抽出。
+///
+/// 默认确认策略：拒绝所有 Confirm 级工具；如需放行，调用方应通过
+/// `Sandbox::with_confirmer` 注入显式确认器或配置策略。
 pub fn default_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<ToolSpec>) {
     let shell = ShellTool::new(working_dir.clone());
     let read = FileReadTool::new(working_dir.clone());
@@ -545,7 +543,7 @@ pub fn default_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<ToolSpe
         ),
     ];
 
-    let mut sb = Sandbox::new(working_dir, auto_confirm());
+    let mut sb = Sandbox::new(working_dir, confirmer_from_fn(|_, _| false));
     sb.register(Box::new(shell));
     sb.register(Box::new(read));
     sb.register(Box::new(write));
@@ -556,6 +554,8 @@ pub fn default_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<ToolSpe
 
 /// 装配受限沙箱（只读 3 工具：read/search/grep）+ 对应 ToolSpec 清单。
 /// 供子代理使用，确保不写不执行 shell。
+///
+/// 默认确认策略与默认沙箱一致：拒绝 Confirm 级工具（本沙箱当前仅含 Allow 级工具）。
 pub fn restricted_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<ToolSpec>) {
     let read = FileReadTool::new(working_dir.clone());
     let search = SearchTool::new(working_dir.clone());
@@ -573,7 +573,7 @@ pub fn restricted_sandbox_with_specs(working_dir: PathBuf) -> (Sandbox, Vec<Tool
         ),
     ];
 
-    let mut sb = Sandbox::new(working_dir, auto_confirm());
+    let mut sb = Sandbox::new(working_dir, confirmer_from_fn(|_, _| false));
     sb.register(Box::new(read));
     sb.register(Box::new(search));
     sb.register(Box::new(grep));

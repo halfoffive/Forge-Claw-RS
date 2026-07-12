@@ -20,12 +20,22 @@ use uuid::Uuid;
 use crate::api::AppState;
 
 /// 用户模型。`token` 字段序列化时跳过，避免泄漏到响应体。
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct User {
     pub id: Uuid,
     pub name: String,
     #[serde(skip_serializing)]
     pub token: String,
+}
+
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// 用户公开信息（响应体用，不含 token）。
@@ -44,21 +54,19 @@ impl From<&User> for UserPublic {
     }
 }
 
-/// 用户存储：按 token / name 双索引查找。放入 `Arc` 后置入 [`AppState`] 共享。
+/// 用户存储：按 name 索引查找；token 查找走常量时间遍历比对（C-006）。
+/// 放入 `Arc` 后置入 [`AppState`] 共享。
 pub struct UserStore {
-    by_token: HashMap<String, User>,
     by_name: HashMap<String, User>,
 }
 
 impl UserStore {
     pub fn new(users: Vec<User>) -> Self {
-        let mut by_token = HashMap::new();
         let mut by_name = HashMap::new();
         for u in users {
-            by_token.insert(u.token.clone(), u.clone());
             by_name.insert(u.name.clone(), u);
         }
-        Self { by_token, by_name }
+        Self { by_name }
     }
 
     /// 工厂：从 (name, token) 对构造，UUID 自动生成。
@@ -96,8 +104,19 @@ impl UserStore {
         Self::from_config(pairs)
     }
 
+    /// 常量时间按 token 查找：遍历全部用户，逐条做 `ConstantTimeEq` 比对，
+    /// 不依赖 HashMap 早退，避免计时侧信道泄漏 token 长度或前缀（C-006）。
     pub fn find_by_token(&self, token: &str) -> Option<User> {
-        self.by_token.get(token).cloned()
+        let token_bytes = token.as_bytes();
+        let mut found: Option<User> = None;
+        for user in self.by_name.values() {
+            let candidate = user.token.as_bytes();
+            let eq = bool::from(candidate.ct_eq(token_bytes));
+            if eq && found.is_none() {
+                found = Some(user.clone());
+            }
+        }
+        found
     }
 
     pub fn find_by_name(&self, name: &str) -> Option<User> {
@@ -136,8 +155,8 @@ pub async fn auth_middleware(
         Some(t) => t,
         None => return unauthorized_response(),
     };
-    // UserStore 内部用 HashMap 索引，token 比对在 find_by_token 内完成。
-    // 此处再用常量时间比对复核，避免 HashMap 早退泄漏长度/前缀信息。
+    // find_by_token 已做常量时间遍历比对；此处再用常量时间比对复核一次，
+    // 作为 defense-in-depth，防止 UserStore 实现未来变更时意外引入早退。
     let user = match state.user_store.find_by_token(token) {
         Some(u) if constant_time_eq(&u.token, token) => u,
         _ => return unauthorized_response(),

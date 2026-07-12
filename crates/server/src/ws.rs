@@ -10,6 +10,7 @@
 //! 心跳与超时（SRV-003/SRV-009）：拆分 socket 为 reader/writer，独立 ping 任务每 30s 发 Ping；
 //! 每帧读 60s 超时，单连接整体 600s 超时。WS 单帧/单消息上限 256KB（SRV-014）。
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,47 @@ fn task_timeout() -> Duration {
         }
     }
     TASK_TIMEOUT
+}
+
+/// 包装 `JoinHandle`，在离开作用域时显式 `abort`，保证 SESSION_TIMEOUT 或断连时
+/// spawned 的 orchestrator 任务不会泄漏（P1-SRV-002）。对已完成的任务调用 abort 是 no-op。
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+}
+
+impl<T> std::ops::Deref for AbortOnDrop<T> {
+    type Target = tokio::task::JoinHandle<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("handle present")
+    }
+}
+
+impl<T> std::ops::DerefMut for AbortOnDrop<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("handle present")
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let inner = self.get_mut().0.as_mut().expect("handle present");
+        std::pin::Pin::new(inner).poll(cx)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,21 +232,37 @@ async fn handle_text_frame(
 
     // 取出或新建会话：只取共享 history Arc，不深拷 messages（R2-SRV-004）。
     // SRV-006：跨用户既存 session_id 发 Error 并 return，不创建不覆盖。
+    // P1-D-004/E-005/C-008：用写锁 entry 原子"取或建"，避免并发请求创建多个 history_arc。
     let history_arc = {
-        let sessions = state.sessions.read().await;
-        match sessions.get(&session_id) {
-            Some(d) if d.user_id == user_id => d.history.clone(),
-            Some(_) => {
-                let _ = send_event(
-                    out_tx,
-                    &OrchestratorEvent::Error {
-                        message: "session not found".into(),
-                    },
-                )
-                .await;
-                return std::ops::ControlFlow::Continue(());
+        let mut sessions = state.sessions.write().await;
+        match sessions.entry(session_id) {
+            Entry::Occupied(e) => {
+                let d = e.get();
+                if d.user_id != user_id {
+                    drop(sessions);
+                    let _ = send_event(
+                        out_tx,
+                        &OrchestratorEvent::Error {
+                            message: "session not found".into(),
+                        },
+                    )
+                    .await;
+                    return std::ops::ControlFlow::Continue(());
+                }
+                d.history.clone()
             }
-            None => Arc::new(RwLock::new(History::new())),
+            Entry::Vacant(e) => {
+                let data = SessionData {
+                    session: Session {
+                        id: session_id,
+                        created_at: Utc::now(),
+                        messages: Vec::new(),
+                    },
+                    history: Arc::new(RwLock::new(History::new())),
+                    user_id,
+                };
+                e.insert(data).history.clone()
+            }
         }
     };
 
@@ -215,10 +273,10 @@ async fn handle_text_frame(
     // SRV-007：history 用 Arc<RwLock<History>> 共享，spawn 任务内持写锁跑 run_streaming，
     // 防止并发请求丢失更新。guard 在任务结束自动释放。
     let history_for_task = history_arc.clone();
-    let mut join = tokio::spawn(async move {
+    let mut join = AbortOnDrop::new(tokio::spawn(async move {
         let mut guard = history_for_task.write().await;
         orch.run_streaming(&mut guard, user_msg, tx).await
-    });
+    }));
 
     // 转发事件给 WS 客户端，并捕获 Complete 的 tool_calls（R2-SRV-008）。
     let mut final_text = String::new();
@@ -230,10 +288,27 @@ async fn handle_text_frame(
     let timeout = tokio::time::sleep(task_timeout());
     tokio::pin!(timeout);
     loop {
+        // 优先处理 receiver：保证已入队的事件（含上游 Error）在 join 完成前被发出，
+        // 避免事件与任务完成同时就绪时随机选择导致漏发（P1-C-011/E-008）。
         tokio::select! {
+            biased;
             event = rx.recv() => {
                 match event {
                     Some(event) => {
+                        // P1-C-011/E-008：上游 Error 事件不直接透传，原始信息落入日志，
+                        // 前端只收到通用文案。
+                        if let OrchestratorEvent::Error { ref message } = event {
+                            tracing::error!(error = %message, "orchestrator error");
+                            let _ = send_event(
+                                out_tx,
+                                &OrchestratorEvent::Error {
+                                    message: "internal error".into(),
+                                },
+                            )
+                            .await;
+                            task_errored = true;
+                            break;
+                        }
                         if let OrchestratorEvent::Complete {
                             ref text,
                             ref tool_calls,
@@ -243,16 +318,12 @@ async fn handle_text_frame(
                             final_tool_calls = tool_calls.clone();
                             got_complete = true;
                         }
-                        let is_terminal = matches!(
-                            event,
-                            OrchestratorEvent::Complete { .. } | OrchestratorEvent::Error { .. }
-                        );
                         if send_event(out_tx, &event).await.is_err() {
                             // 客户端已断开：停止生成并释放锁。
                             join.abort();
                             break;
                         }
-                        if is_terminal {
+                        if got_complete {
                             break;
                         }
                     }
@@ -318,6 +389,8 @@ async fn handle_text_frame(
             _ = &mut timeout => {
                 tracing::error!("orchestrator task timed out after {:?}", task_timeout());
                 join.abort();
+                // 等待任务真正释放 history 写锁后再继续，避免同 session 后续请求阻塞。
+                let _ = join.await;
                 task_errored = true;
                 let _ = send_event(
                     out_tx,
@@ -333,6 +406,7 @@ async fn handle_text_frame(
     drop(rx);
 
     // 回写会话。R2-SRV-004：append 新消息而非整体 insert，避免并发覆盖。
+    // P1-D-015/E-006/C-009：写回前复核 user_id，跨用户时不污染既有会话。
     if !task_errored && got_complete {
         let assistant_tool_calls: Vec<ToolCall> = final_tool_calls
             .iter()
@@ -351,10 +425,10 @@ async fn handle_text_frame(
         ];
         let mut sessions = state.sessions.write().await;
         match sessions.get_mut(&session_id) {
-            Some(d) => {
+            Some(d) if d.user_id == user_id => {
                 d.session.messages.extend(new_messages);
             }
-            None => {
+            _ => {
                 sessions.insert(
                     session_id,
                     SessionData {

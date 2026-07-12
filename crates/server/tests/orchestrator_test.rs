@@ -302,6 +302,40 @@ async fn run_streaming_same_name_tool_calls_match_by_call_id() {
 }
 
 #[tokio::test]
+async fn run_streaming_stops_when_receiver_dropped() {
+    // D-006/B-003：receiver 被 drop 后，run_streaming 应优雅停止并返回 Ok，
+    // 而不是 panic 或返回 Err。
+    let scripts = vec![vec![
+        Event::Delta("a".into()),
+        Event::Delta("b".into()),
+        Event::Delta("c".into()),
+    ]];
+    let (orch, _dir) = build_orch(scripts);
+    let mut history = History::with_system("sys");
+    let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(2);
+    let orch_arc = Arc::new(orch);
+    let handle = {
+        let orch = orch_arc.clone();
+        tokio::spawn(async move { orch.run_streaming(&mut history, "go".into(), tx).await })
+    };
+
+    let ev = rx.recv().await.expect("first delta");
+    assert!(
+        matches!(ev, OrchestratorEvent::Delta { ref text } if text == "a"),
+        "expected first delta, got {:?}",
+        ev
+    );
+    drop(rx);
+
+    let result = handle.await.expect("task panicked");
+    assert!(
+        result.is_ok(),
+        "receiver dropped should return Ok, got {:?}",
+        result
+    );
+}
+
+#[tokio::test]
 async fn dispatch_subagent_returns_summary() {
     let (orch, _dir) = build_orch(vec![vec![
         Event::Delta("explore-summary".into()),
@@ -427,6 +461,60 @@ async fn run_once_llm_error_does_not_modify_history() {
 }
 
 #[tokio::test]
+async fn run_once_propagates_llm_stream_error() {
+    // D-004：LLM 流内 Error 事件应被 run_once 包装为 OrchestratorEvent::Error 返回。
+    let scripts = vec![vec![Event::Error("stream-boom".into())]];
+    let (orch, _dir) = build_orch(scripts);
+    let mut history = History::with_system("sys");
+    let event = orch.run_once(&mut history, "x".into()).await.unwrap();
+    assert!(
+        matches!(event, OrchestratorEvent::Error { .. }),
+        "expected Error event, got {:?}",
+        event
+    );
+    match event {
+        OrchestratorEvent::Error { message } => {
+            assert_eq!(message, "stream-boom");
+        }
+        other => panic!("expected Error event, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn run_once_invalid_tool_arguments_returns_tool_result_error() {
+    // D-012：工具参数 JSON 解析失败时，ToolResult.error 应包含 "invalid tool input"。
+    let scripts = vec![
+        vec![Event::ToolCallDelta {
+            index: 0,
+            id: Some("c1".into()),
+            name: Some("read".into()),
+            arguments: Some("not-json".into()),
+        }],
+        vec![Event::Delta("done".into()), Event::Done],
+    ];
+    let (orch, _dir) = build_orch(scripts);
+    let mut history = History::with_system("sys");
+    let event = orch.run_once(&mut history, "x".into()).await.unwrap();
+    match event {
+        OrchestratorEvent::Complete { text, tool_calls } => {
+            assert_eq!(text, "done");
+            assert_eq!(tool_calls.len(), 1);
+            let err = tool_calls[0]
+                .result
+                .error
+                .as_ref()
+                .expect("tool result should carry error");
+            assert!(
+                err.contains("invalid tool input"),
+                "expected error to contain 'invalid tool input', got: {}",
+                err
+            );
+        }
+        other => panic!("expected Complete event, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn run_once_tool_error_feeds_error_into_history() {
     // 工具执行失败后，回填给 LLM 的 tool_msg.content 应包含错误描述，而不是空字符串。
     let scripts = vec![
@@ -502,4 +590,34 @@ async fn compile_prompt_with_real_profiles_succeeds() {
     assert!(prompt.contains("## 身份与产品信息"));
     assert!(prompt.contains("deepseek-chat"));
     assert!(prompt.contains("read"));
+}
+
+#[tokio::test]
+async fn default_sandbox_denies_file_write_without_confirmation() {
+    // C-005：server 模式默认沙箱不得自动放行 Confirm 级 FileWriteTool。
+    let dir = tempdir().unwrap();
+    let (sandbox, _specs) = default_sandbox_with_specs(dir.path().to_path_buf());
+    let target_file = dir.path().join("should_not_exist.txt");
+
+    let result = sandbox
+        .execute(
+            "write",
+            serde_json::json!({
+                "path": "should_not_exist.txt",
+                "content": "written by auto-confirm"
+            }),
+        )
+        .await
+        .expect("sandbox execute returned Err");
+
+    assert_eq!(
+        result.error.as_deref(),
+        Some("blocked: user denied"),
+        "FileWriteTool 应因未显式确认而被拒绝，got {:?}",
+        result
+    );
+    assert!(
+        !target_file.exists(),
+        "被拒绝后目标文件不应被创建"
+    );
 }

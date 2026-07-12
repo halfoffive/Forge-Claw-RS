@@ -9,6 +9,7 @@
 //! WS 一次性 ticket：[`AppState`] 维护 `tickets` 表（`Mutex<HashMap>`），由
 //! `issue_ticket`/`consume_ticket` 签发与核销（60s TTL，用后即焚）。
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ use uuid::Uuid;
 
 use forgeclaw_core::error::CoreError;
 use forgeclaw_core::model::{AssistantMsg, Message, Session, ToolCall};
-use forgeclaw_llm::{History, ToolSpec};
+use forgeclaw_llm::{History, Role, ToolSpec};
 
 use crate::auth::{AuthUser, UserStore};
 use crate::orchestrator::{Orchestrator, OrchestratorEvent, ToolCallRecord};
@@ -45,7 +46,8 @@ pub struct AppState {
 
 /// 单会话数据：核心 Session（含展示用 messages）+ LLM History（cache-first 前缀）+ 所属用户。
 ///
-/// `history` 用 `Arc<RwLock<History>>` 共享，`chat_handler` 持写锁跑 LLM 防丢失更新（SRV-007）。
+/// `history` 用 `Arc<RwLock<History>>` 共享，`chat_handler` 先读锁快照、释放后跑 LLM，
+/// 最后持写锁提交新增后缀，避免 LLM 期间阻塞同 session 只读查询（D-001 / SRV-007）。
 #[derive(Clone)]
 pub struct SessionData {
     pub session: Session,
@@ -180,26 +182,57 @@ pub async fn chat_handler(
 
     // 取出或新建会话：只取共享 history Arc，不深拷 messages（R2-SRV-004）。
     // 跨用户访问既存 session_id 返回 404 不泄漏存在性。
+    // P1-D-004/E-005/C-008：用写锁 entry 原子"取或建"，避免并发请求创建多个 history_arc。
     let history_arc = {
-        let sessions = state.sessions.read().await;
-        match sessions.get(&session_id) {
-            Some(d) if d.user_id == user.id => d.history.clone(),
-            Some(_) => {
-                return Err((StatusCode::NOT_FOUND, "session not found".into()));
+        let mut sessions = state.sessions.write().await;
+        match sessions.entry(session_id) {
+            Entry::Occupied(e) => {
+                let d = e.get();
+                if d.user_id != user.id {
+                    return Err((StatusCode::NOT_FOUND, "session not found".into()));
+                }
+                d.history.clone()
             }
-            None => Arc::new(RwLock::new(History::new())),
+            Entry::Vacant(e) => {
+                let data = SessionData {
+                    session: Session {
+                        id: session_id,
+                        created_at: Utc::now(),
+                        messages: Vec::new(),
+                    },
+                    history: Arc::new(RwLock::new(History::new())),
+                    user_id: user.id,
+                };
+                e.insert(data).history.clone()
+            }
         }
     };
 
-    // 持 history 写锁跑 run_once，避免并发请求丢失更新（SRV-007）。
-    let event = {
-        let mut history_guard = history_arc.write().await;
-        state
-            .orchestrator
-            .run_once(&mut history_guard, req.message.clone())
-            .await
-            .map_err(internal_error)?
+    // D-001：读锁快照 → 释放锁跑 LLM → 写锁只提交新增后缀。
+    // 这样同 session 的只读查询（get_session/list_sessions）不会被长时间 LLM 调用阻塞。
+    let mut history_snapshot = {
+        let history_guard = history_arc.read().await;
+        history_guard.clone()
     };
+    let snapshot_len = history_snapshot.len();
+    let event = state
+        .orchestrator
+        .run_once(&mut history_snapshot, req.message.clone())
+        .await
+        .map_err(internal_error)?;
+    {
+        let mut history_guard = history_arc.write().await;
+        let new_messages = history_snapshot.messages()[snapshot_len..].iter().cloned();
+        let new_messages: Vec<_> = if history_guard.is_empty() {
+            new_messages.collect()
+        } else {
+            // 并发首请求已写入 system 前缀时，跳过后续请求 suffix 中的重复 system。
+            new_messages
+                .skip_while(|m| m.role == Role::System)
+                .collect()
+        };
+        history_guard.extend(new_messages);
+    }
 
     let (text, tool_calls) = match event {
         OrchestratorEvent::Complete { text, tool_calls } => (text, tool_calls),
@@ -235,13 +268,14 @@ pub async fn chat_handler(
             tool_calls: assistant_tool_calls,
         }),
     ];
+    // P1-D-015/E-006/C-009：写回前复核 user_id，跨用户时不污染既有会话。
     {
         let mut sessions = state.sessions.write().await;
         match sessions.get_mut(&session_id) {
-            Some(d) => {
+            Some(d) if d.user_id == user.id => {
                 d.session.messages.extend(new_messages);
             }
-            None => {
+            _ => {
                 sessions.insert(
                     session_id,
                     SessionData {

@@ -614,11 +614,13 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -629,6 +631,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "uuid",
 ]

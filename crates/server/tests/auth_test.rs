@@ -13,7 +13,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use forgeclaw_core::model::Session;
 use forgeclaw_llm::{ChatRequest, Event, History, LlmClient};
-use forgeclaw_server::{app, AppState, Orchestrator, SessionData, UserStore};
+use forgeclaw_server::{app, AppState, Orchestrator, SessionData, User, UserStore};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -448,8 +448,11 @@ async fn ws_invalid_session_id_returns_error_frame() {
 }
 
 #[tokio::test]
-async fn ws_orchestrator_error_returns_error_frame() {
-    let llm: Arc<dyn LlmClient> = Arc::new(MockClient::new(vec![Event::Error("boom".into())]));
+async fn ws_orchestrator_error_returns_generic_error_frame() {
+    // P1-C-011/E-008：上游 Error 事件不应直接透传给前端。
+    let llm: Arc<dyn LlmClient> = Arc::new(MockClient::new(vec![Event::Error(
+        "upstream LLM failed: https://api.example.com 401 Unauthorized".into(),
+    )]));
     let (state, _dir) = build_state_with_llm(llm);
     let alice = state.user_store.find_by_name("alice").expect("user exists");
     let ticket = state.issue_ticket(alice.id);
@@ -463,7 +466,10 @@ async fn ws_orchestrator_error_returns_error_frame() {
     let text = recv_text(&mut ws).await;
     let ev: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(ev["type"], "error");
-    assert!(ev["message"].as_str().unwrap().contains("boom"));
+    assert_eq!(ev["message"], "internal error");
+    let msg = ev["message"].as_str().unwrap();
+    assert!(!msg.contains("api.example.com"), "不应泄漏上游 URL");
+    assert!(!msg.contains("401"), "不应泄漏上游状态码");
 
     let _ = ws.close(None).await;
     handle.abort();
@@ -505,4 +511,166 @@ async fn ws_timeout_aborts_task_and_returns_error_frame() {
     let _ = ws.close(None).await;
     handle.abort();
     std::env::remove_var("FORGECLAW_WS_TASK_TIMEOUT_SECS");
+}
+
+#[tokio::test]
+async fn ws_cross_user_session_does_not_pollute() {
+    // P1-D-015/E-006/C-009：bob 用 alice 的 session_id 发 WS 消息，应收到 error 帧且 alice 会话不被污染。
+    let (state, _dir) = build_state();
+    let alice_sid = insert_session_for(&state, "alice").await;
+
+    let bob = state.user_store.find_by_name("bob").expect("user exists");
+    let ticket = state.issue_ticket(bob.id);
+    let (addr, handle) = start_server(state.clone()).await;
+
+    let mut ws = connect_ws(addr, &ticket).await;
+    ws.send(WsMessage::Text(
+        format!(r#"{{"message":"bob hi","session_id":"{}"}}"#, alice_sid).into(),
+    ))
+    .await
+    .unwrap();
+
+    let text = recv_text(&mut ws).await;
+    let ev: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ev["type"], "error");
+
+    let sessions = state.sessions.read().await;
+    let data = sessions.get(&alice_sid).expect("alice session exists");
+    assert!(data.session.messages.is_empty(), "alice 的会话不应被 bob 写回污染");
+
+    let _ = ws.close(None).await;
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ws_timeout_does_not_block_subsequent_same_session_request() {
+    // P1-D-002/D-003/E-007/C-010：超时后同 session 的后续请求不应因未释放锁而阻塞。
+    struct SleepThenDoneClient {
+        counter: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for SleepThenDoneClient {
+        async fn chat(&self, _req: ChatRequest) -> anyhow::Result<BoxStream<'static, Event>> {
+            let n = self.counter.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(Box::pin(futures::stream::once(async {
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    Event::Done
+                })))
+            } else {
+                Ok(Box::pin(futures::stream::iter(vec![Event::Done])))
+            }
+        }
+    }
+
+    std::env::set_var("FORGECLAW_WS_TASK_TIMEOUT_SECS", "1");
+    let (state, _dir) = build_state_with_llm(Arc::new(SleepThenDoneClient {
+        counter: AtomicUsize::new(0),
+    }));
+    let alice = state.user_store.find_by_name("alice").expect("user exists");
+    let ticket = state.issue_ticket(alice.id);
+    let (addr, handle) = start_server(state).await;
+
+    let mut ws = connect_ws(addr, &ticket).await;
+    let session_id = Uuid::new_v4();
+
+    ws.send(WsMessage::Text(
+        format!(r#"{{"message":"first","session_id":"{}"}}"#, session_id).into(),
+    ))
+    .await
+    .unwrap();
+    let text = tokio::time::timeout(Duration::from_secs(5), recv_text(&mut ws))
+        .await
+        .expect("should receive timeout error frame before 5s");
+    let ev: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ev["type"], "error");
+    assert_eq!(ev["message"], "orchestrator task timed out");
+
+    ws.send(WsMessage::Text(
+        format!(r#"{{"message":"second","session_id":"{}"}}"#, session_id).into(),
+    ))
+    .await
+        .unwrap();
+    let text = tokio::time::timeout(Duration::from_secs(5), recv_text(&mut ws))
+        .await
+        .expect("subsequent request should not be blocked");
+    let ev: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ev["type"], "complete");
+
+    let _ = ws.close(None).await;
+    handle.abort();
+    std::env::remove_var("FORGECLAW_WS_TASK_TIMEOUT_SECS");
+}
+
+// ============ 安全侧信道测试 ============
+
+#[test]
+fn find_by_token_returns_correct_user_or_none() {
+    let store = UserStore::from_config(vec![
+        ("alice".into(), ALICE_TOKEN.into()),
+        ("bob".into(), BOB_TOKEN.into()),
+    ]);
+    assert_eq!(
+        store.find_by_token(ALICE_TOKEN).map(|u| u.name),
+        Some("alice".to_string())
+    );
+    assert_eq!(
+        store.find_by_token(BOB_TOKEN).map(|u| u.name),
+        Some("bob".to_string())
+    );
+    assert!(store.find_by_token("not-a-token").is_none());
+}
+
+#[test]
+fn find_by_token_timing_is_independent_of_token_existence() {
+    // C-006：构造足够多的用户，使遍历成本显著，便于检测是否存在早退。
+    let mut pairs = Vec::new();
+    for i in 0..100 {
+        pairs.push((format!("user-{i}"), format!("token-{i:0>3}")));
+    }
+    let store = UserStore::from_config(pairs);
+    let valid_token = "token-050";
+    let invalid_token = "token-999";
+
+    let iterations = 500;
+
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = store.find_by_token(valid_token);
+    }
+    let valid_duration = start.elapsed();
+
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = store.find_by_token(invalid_token);
+    }
+    let invalid_duration = start.elapsed();
+
+    let ratio = valid_duration.as_secs_f64() / invalid_duration.as_secs_f64().max(1e-9);
+    assert!(
+        ratio >= 0.25 && ratio <= 4.0,
+        "valid/invalid lookup time ratio {ratio} is outside expected range; \
+         valid={valid_duration:?}, invalid={invalid_duration:?}"
+    );
+}
+
+#[test]
+fn user_debug_does_not_leak_token() {
+    // C-007：Debug 输出中 token 字段应被脱敏，不泄漏真实值。
+    let user = User {
+        id: Uuid::new_v4(),
+        name: "alice".into(),
+        token: "super-secret-token-12345".into(),
+    };
+    let debug = format!("{:?}", user);
+    assert!(
+        !debug.contains("super-secret-token-12345"),
+        "Debug output leaked token: {debug}"
+    );
+    assert!(debug.contains("alice"), "Debug output should contain name: {debug}");
+    assert!(
+        debug.contains("<redacted>"),
+        "token field should be redacted: {debug}"
+    );
 }

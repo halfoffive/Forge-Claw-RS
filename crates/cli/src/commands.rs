@@ -302,9 +302,9 @@ pub async fn run_run(cfg: Config, task: String, auto_apply: bool) -> anyhow::Res
 // ============ prompt ============
 
 pub async fn run_prompt_compile(cfg: Config, profile: String) -> anyhow::Result<()> {
-    let mut engine = PromptEngine::new(cfg.prompts_root.clone());
+    let engine = PromptEngine::new(cfg.prompts_root.clone());
     let vars = prompt_vars(&cfg);
-    let prompt = engine.compile(&profile, &vars)?;
+    let prompt = engine.compile(&profile, &vars).await?;
     print!("{prompt}");
     if !prompt.ends_with('\n') {
         println!();

@@ -107,11 +107,30 @@ jobs:
           $hash = (Get-FileHash forgeclaw-cli-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  forgeclaw-cli-${{ matrix.target }}.zip" | Out-File -Encoding ascii forgeclaw-cli-${{ matrix.target }}.zip.sha256
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: forgeclaw-cli-${{ matrix.target }}
+          path: |
             forgeclaw-cli-${{ matrix.target }}.tar.gz
             forgeclaw-cli-${{ matrix.target }}.tar.gz.sha256
             forgeclaw-cli-${{ matrix.target }}.zip
             forgeclaw-cli-${{ matrix.target }}.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
