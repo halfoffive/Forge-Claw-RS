@@ -199,9 +199,8 @@ impl Tool for ShellTool {
                 let landlock_dir = working_dir.clone();
                 unsafe {
                     child.pre_exec(move || {
-                        crate::sandbox::apply_landlock(&landlock_dir).map_err(|e| {
-                            std::io::Error::other(e.to_string())
-                        })
+                        crate::sandbox::apply_landlock(&landlock_dir)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
                     });
                 }
             }
