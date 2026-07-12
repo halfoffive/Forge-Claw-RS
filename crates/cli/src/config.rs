@@ -172,12 +172,12 @@ fn set_windows_owner_only_dacl(path: &std::path::Path) -> anyhow::Result<()> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE};
     use windows_sys::Win32::Security::Authorization::{
-        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS,
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT,
         TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -321,8 +321,8 @@ mod tests {
         use windows_sys::Win32::Foundation::{GetLastError, LocalFree, PSID};
         use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{
-            ACL, ACL_SIZE_INFORMATION, AclSizeInformation, ACCESS_ALLOWED_ACE,
-            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, IsValidSid,
+            AclSizeInformation, EqualSid, GetAce, GetAclInformation, IsValidSid,
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
             PSECURITY_DESCRIPTOR,
         };
         use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
@@ -339,8 +339,11 @@ mod tests {
         let user_sid = CurrentUserSid::get().unwrap();
 
         unsafe {
-            let path_wide: Vec<u16> =
-                config_file.as_os_str().encode_wide().chain(Some(0)).collect();
+            let path_wide: Vec<u16> = config_file
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
             let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             let mut dacl: *mut ACL = std::ptr::null_mut();
             let err = GetNamedSecurityInfoW(
@@ -363,10 +366,7 @@ mod tests {
                 AclSizeInformation,
             );
             assert!(ok != 0, "GetAclInformation failed: {}", GetLastError());
-            assert_eq!(
-                size_info.AceCount, 1,
-                "DACL should contain exactly one ACE"
-            );
+            assert_eq!(size_info.AceCount, 1, "DACL should contain exactly one ACE");
 
             let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
             let ok = GetAce(dacl, 0, &mut ace);
@@ -436,7 +436,7 @@ mod tests {
             use std::ptr::null_mut;
             use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
             use windows_sys::Win32::Security::{
-                GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+                GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
             };
             use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 

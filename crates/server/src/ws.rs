@@ -89,7 +89,10 @@ impl<T> Drop for AbortOnDrop<T> {
 impl<T> std::future::Future for AbortOnDrop<T> {
     type Output = Result<T, tokio::task::JoinError>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         let inner = self.get_mut().0.as_mut().expect("handle present");
         std::pin::Pin::new(inner).poll(cx)
     }

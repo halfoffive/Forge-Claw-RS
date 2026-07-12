@@ -134,7 +134,11 @@ impl PromptEngine {
     ///
     /// `vars` 中常见的 key：`tools` / `model` / `cwd`，
     /// 会替换 section body 中的 `{{tools}}` / `{{model}}` / `{{cwd}}`。
-    pub async fn compile(&self, profile_name: &str, vars: &HashMap<&str, String>) -> Result<String> {
+    pub async fn compile(
+        &self,
+        profile_name: &str,
+        vars: &HashMap<&str, String>,
+    ) -> Result<String> {
         // 1. 文件 IO 在锁外完成。
         let sections = self.load_all_sections_async(profile_name).await?;
         let enabled = enabled_sorted(sections);
@@ -242,7 +246,10 @@ mod tests {
     #[tokio::test]
     async fn compiles_default_profile_with_all_sections() {
         let engine = PromptEngine::new(profiles_root());
-        let out = engine.compile("default", &vars()).await.expect("compile failed");
+        let out = engine
+            .compile("default", &vars())
+            .await
+            .expect("compile failed");
         for title in ["身份与产品信息", "安全与拒绝处理", "工具使用", "语气与格式"]
         {
             assert!(
@@ -255,7 +262,10 @@ mod tests {
     #[tokio::test]
     async fn variables_are_replaced() {
         let engine = PromptEngine::new(profiles_root());
-        let out = engine.compile("default", &vars()).await.expect("compile failed");
+        let out = engine
+            .compile("default", &vars())
+            .await
+            .expect("compile failed");
         assert!(
             !out.contains("{{tools}}"),
             "tools variable not replaced\n{out}"
@@ -320,7 +330,10 @@ mod tests {
 
         let mut prompts = Vec::new();
         for handle in handles {
-            let prompt = handle.await.expect("task panicked").expect("compile failed");
+            let prompt = handle
+                .await
+                .expect("task panicked")
+                .expect("compile failed");
             assert!(prompt.contains("## 身份与产品信息"));
             prompts.push(prompt);
         }
@@ -328,7 +341,10 @@ mod tests {
         // 所有结果应相同（共享缓存）。
         let first = prompts.first().unwrap();
         for prompt in &prompts {
-            assert_eq!(prompt, first, "all concurrent compiles should return identical prompt");
+            assert_eq!(
+                prompt, first,
+                "all concurrent compiles should return identical prompt"
+            );
         }
 
         // 虽然 10 个任务并发，但 key 相同，只应实际编译一次。

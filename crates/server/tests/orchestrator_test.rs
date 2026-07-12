@@ -282,9 +282,9 @@ async fn run_streaming_same_name_tool_calls_match_by_call_id() {
     let results: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            OrchestratorEvent::ToolResult { call_id, result, .. } => {
-                Some((call_id.clone(), result.output.clone()))
-            }
+            OrchestratorEvent::ToolResult {
+                call_id, result, ..
+            } => Some((call_id.clone(), result.output.clone())),
             _ => None,
         })
         .collect();
@@ -616,8 +616,5 @@ async fn default_sandbox_denies_file_write_without_confirmation() {
         "FileWriteTool 应因未显式确认而被拒绝，got {:?}",
         result
     );
-    assert!(
-        !target_file.exists(),
-        "被拒绝后目标文件不应被创建"
-    );
+    assert!(!target_file.exists(), "被拒绝后目标文件不应被创建");
 }

@@ -223,7 +223,10 @@ async fn post_api_prompts_compile_invalid_name_returns_404() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
-    assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "profile not found");
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        "profile not found"
+    );
 }
 
 #[tokio::test]
@@ -303,7 +306,10 @@ async fn get_api_prompts_sections_invalid_name_returns_404() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
-    assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "profile not found");
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        "profile not found"
+    );
 }
 
 #[tokio::test]
@@ -512,10 +518,9 @@ async fn read_query_not_blocked_by_slow_llm_call() {
     }
 
     let app = app(state.clone());
-    let chat_body = serde_json::to_vec(
-        &json!({"message":"hello","session_id":session_id.to_string()}),
-    )
-    .unwrap();
+    let chat_body =
+        serde_json::to_vec(&json!({"message":"hello","session_id":session_id.to_string()}))
+            .unwrap();
     let chat_fut = tokio::spawn({
         let app = app.clone();
         async move {
@@ -562,11 +567,9 @@ async fn concurrent_new_session_requests_create_single_shared_history() {
     let (state, _dir) = build_state();
     let session_id = Uuid::new_v4();
     let body1 =
-        serde_json::to_vec(&json!({"message":"msg1","session_id":session_id.to_string()}))
-            .unwrap();
+        serde_json::to_vec(&json!({"message":"msg1","session_id":session_id.to_string()})).unwrap();
     let body2 =
-        serde_json::to_vec(&json!({"message":"msg2","session_id":session_id.to_string()}))
-            .unwrap();
+        serde_json::to_vec(&json!({"message":"msg2","session_id":session_id.to_string()})).unwrap();
 
     let app = app(state.clone());
     let fut1 = app.clone().oneshot(
@@ -606,7 +609,11 @@ async fn concurrent_new_session_requests_create_single_shared_history() {
         .filter(|m| m.role == Role::Assistant)
         .collect();
     assert_eq!(user_msgs.len(), 2, "两个 user 消息都应写入同一 history");
-    assert_eq!(assistant_msgs.len(), 2, "两个 assistant 消息都应写入同一 history");
+    assert_eq!(
+        assistant_msgs.len(),
+        2,
+        "两个 assistant 消息都应写入同一 history"
+    );
     assert_eq!(
         data.session.messages.len(),
         4,
@@ -637,8 +644,7 @@ async fn chat_with_other_users_session_returns_404_and_does_not_pollute() {
     }
 
     let body =
-        serde_json::to_vec(&json!({"message":"bob says hi","session_id":sid.to_string()}))
-            .unwrap();
+        serde_json::to_vec(&json!({"message":"bob says hi","session_id":sid.to_string()})).unwrap();
     let response = app(state.clone())
         .oneshot(
             Request::builder()

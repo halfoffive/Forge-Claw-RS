@@ -18,8 +18,8 @@ use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tempfile::tempdir;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -393,17 +393,19 @@ async fn ws_with_valid_ticket_passes_auth() {
 
 // ============ WebSocket 真实消息流集成测试 ============
 
-type TestWs = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn start_server(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            app(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     (addr, handle)
 }
@@ -536,7 +538,10 @@ async fn ws_cross_user_session_does_not_pollute() {
 
     let sessions = state.sessions.read().await;
     let data = sessions.get(&alice_sid).expect("alice session exists");
-    assert!(data.session.messages.is_empty(), "alice 的会话不应被 bob 写回污染");
+    assert!(
+        data.session.messages.is_empty(),
+        "alice 的会话不应被 bob 写回污染"
+    );
 
     let _ = ws.close(None).await;
     handle.abort();
@@ -591,7 +596,7 @@ async fn ws_timeout_does_not_block_subsequent_same_session_request() {
         format!(r#"{{"message":"second","session_id":"{}"}}"#, session_id).into(),
     ))
     .await
-        .unwrap();
+    .unwrap();
     let text = tokio::time::timeout(Duration::from_secs(5), recv_text(&mut ws))
         .await
         .expect("subsequent request should not be blocked");
@@ -668,7 +673,10 @@ fn user_debug_does_not_leak_token() {
         !debug.contains("super-secret-token-12345"),
         "Debug output leaked token: {debug}"
     );
-    assert!(debug.contains("alice"), "Debug output should contain name: {debug}");
+    assert!(
+        debug.contains("alice"),
+        "Debug output should contain name: {debug}"
+    );
     assert!(
         debug.contains("<redacted>"),
         "token field should be redacted: {debug}"

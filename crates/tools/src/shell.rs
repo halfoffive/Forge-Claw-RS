@@ -468,7 +468,10 @@ mod tests {
         assert!(!r.output.contains("FORGECLAW_USERS"));
         assert!(!r.output.contains("DEEPSEEK_API_KEY"));
 
-        let r = tool.execute(json!({"command": "printenv PATH"})).await.unwrap();
+        let r = tool
+            .execute(json!({"command": "printenv PATH"}))
+            .await
+            .unwrap();
         assert!(r.error.is_none(), "stderr: {:?}", r.error);
         assert!(!r.output.trim().is_empty(), "PATH should be preserved");
     }

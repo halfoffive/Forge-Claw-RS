@@ -19,7 +19,10 @@ async fn linux_landlock_blocks_write_outside_working_dir() {
     let _ = std::fs::remove_file(marker);
 
     let r = sb
-        .execute("shell", json!({"command": "cd / && touch /tmp/fc_landlock_outside_test_marker"}))
+        .execute(
+            "shell",
+            json!({"command": "cd / && touch /tmp/fc_landlock_outside_test_marker"}),
+        )
         .await
         .unwrap();
 
@@ -45,7 +48,10 @@ async fn linux_landlock_allows_write_inside_working_dir() {
     sb.register(Box::new(ShellTool::new(dir.path().to_path_buf())));
 
     let r = sb
-        .execute("shell", json!({"command": "touch inside.txt && ls inside.txt"}))
+        .execute(
+            "shell",
+            json!({"command": "touch inside.txt && ls inside.txt"}),
+        )
         .await
         .unwrap();
 

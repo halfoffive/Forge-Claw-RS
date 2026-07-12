@@ -178,8 +178,8 @@ impl Sandbox {
 #[cfg(target_os = "linux")]
 pub fn apply_landlock(working_dir: &Path) -> anyhow::Result<()> {
     use landlock::{
-        Access, AccessFs, AccessNet, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, ABI,
+        Access, AccessFs, AccessNet, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus, ABI,
     };
 
     // ABI::V4 引入 TCP connect/bind；若内核不支持，BestEffort 兼容性会自动降级。
