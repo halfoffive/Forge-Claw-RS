@@ -89,7 +89,7 @@
 
 ### 阶段 2：本次新增高价值 P1（7 条）
 
-- [ ] Task 14: [A-001 / A-002] [P1] CLI confirm 模式抽象为可复用、可测试的 `AsyncConfirmer`
+- [x] Task 14: [A-001 / A-002] [P1] CLI confirm 模式抽象为可复用、可测试的 `AsyncConfirmer`
   - 修复目标：删除 `crates/cli/src/commands.rs:61-128` 中对 server 侧默认沙箱的重复构造；`Sandbox` 暴露 `with_confirmer()` 方法，server 工厂返回 `(Sandbox, Vec<ToolSpec>)`，CLI confirm 模式直接复用默认沙箱并替换 confirmer；将阻塞 stdin 的闭包改为 `AsyncConfirmer` trait 或 channel 驱动（CLI 在 `spawn_blocking` 读 stdin，测试通过 mock channel 注入 `true/false`）。验证：server 默认工具描述变更后 CLI confirm 模式自动同步；confirm 模式可单元测试且不阻塞 runtime。
   - 受影响：`crates/cli/src/commands.rs`、`crates/tools/src/sandbox.rs`（可能）、`crates/server/src/orchestrator.rs`
   - 可并行：是
@@ -119,13 +119,13 @@
   - 可并行：否（与 Task 22 同文件，建议合并）
   - REAUDIT 重复：无（NEW）
 
-- [ ] Task 19: [E-009] [P1] 编排器事件增加 `call_id`
+- [x] Task 19: [E-009] [P1] 编排器事件增加 `call_id`
   - 修复目标：`crates/server/src/orchestrator.rs` 的 `ToolCallStart`/`ToolResult` 事件增加 `call_id`（取自 LLM 返回的 `tool_call.id`）；`crates/llm/src/lib.rs` 的 `ToolCall` 序列化保留 id；`web/src/views/ChatView.vue` 的 tool_result 回填改按 `call_id` 匹配；更新 `web/src/api/types.ts`。新增测试验证并发同名工具调用结果回填正确。
   - 受影响：`crates/server/src/orchestrator.rs`、`crates/llm/src/lib.rs`、`web/src/views/ChatView.vue`、`web/src/api/types.ts`
   - 可并行：否（跨前后端，需协调）
   - REAUDIT 重复：`REAUDIT_REPORT.md` E-NEW-001
 
-- [ ] Task 20: [F-003] [P1] release 产物上传竞态
+- [x] Task 20: [F-003] [P1] release 产物上传竞态
   - 修复目标：`.github/workflows/release.yml` 将 6 目标矩阵每个 job 都调用 `action-gh-release` 改为单汇总 job（`needs: build`）先 `download-artifact` 收集全部产物，再统一上传；验证多目标 release 产物完整无覆盖。
   - 受影响：`.github/workflows/release.yml`
   - 可并行：是
@@ -157,7 +157,7 @@
   - 可并行：是
   - REAUDIT 重复：无（NEW）
 
-- [ ] Task 25: [D-007 / E-011] [P1] `PromptEngine` 整段持 `tokio::Mutex` 且含同步文件 IO
+- [x] Task 25: [D-007 / E-011] [P1] `PromptEngine` 整段持 `tokio::Mutex` 且含同步文件 IO
   - 修复目标：`crates/core/src/prompt/engine.rs` 的 `PromptEngine` 从 `tokio::Mutex` 拆为 `Arc<RwLock>` + `AtomicUsize`，`compile` 退化为 `&self`；cache 拆 `Arc<RwLock<HashMap>>` 短临界区；文件读取改 `tokio::fs` 在锁外完成；新增并发测试验证慢盘下不阻塞多个 compile 请求。
   - 受影响：`crates/core/src/prompt/engine.rs`、`crates/server/src/orchestrator.rs`
   - 可并行：是
@@ -169,7 +169,7 @@
   - 可并行：是
   - REAUDIT 重复：`REAUDIT_REPORT.md` C-017
 
-- [ ] Task 27: [C-006] [P1] `find_by_token` 非常量时间查找
+- [x] Task 27: [C-006] [P1] `find_by_token` 非常量时间查找
   - 修复目标：`crates/server/src/auth.rs:99-101` 改常量时间查找（遍历全部用户对每条 token 做 `subtle::ConstantTimeEq`，不短路）；新增测试验证不存在 token 与存在 token 的查找时间无显著差异。
   - 受影响：`crates/server/src/auth.rs`、`crates/server/Cargo.toml`（若引入 subtle）
   - 可并行：是
@@ -181,19 +181,19 @@
   - 可并行：是
   - REAUDIT 重复：`REAUDIT_REPORT.md` C-016 / C-019
 
-- [ ] Task 29: [C-011 / E-008] [P1] WS Error 事件直接透传上游敏感信息
+- [x] Task 29: [C-011 / E-008] [P1] WS Error 事件直接透传上游敏感信息
   - 修复目标：`crates/server/src/ws.rs:271-279,285-291` 的 `OrchestratorEvent::Error { message }` 经 `send_event` 时改传通用文案（如 `"internal error"`），原始 message 落 `tracing::error!`；新增测试验证前端收到的 error 不含上游 API URL/状态码。
   - 受影响：`crates/server/src/ws.rs`
   - 可并行：否（与 Task 21/22/23 同文件，建议合并）
   - REAUDIT 重复：`REAUDIT_REPORT.md` D-009
 
-- [ ] Task 30: [C-012] [P1] Windows 下配置文件权限未限制
+- [x] Task 30: [C-012] [P1] Windows 下配置文件权限未限制
   - 修复目标：`crates/cli/src/config.rs:100-114` 的 `Config::save` 在 Windows 分支使用 `std::os::windows::fs` 或 Win32 API 设置显式 ACL，限制仅当前用户可读写；新增测试（至少文档化）验证保存后文件 ACL 正确。
   - 受影响：`crates/cli/src/config.rs`
   - 可并行：是
   - REAUDIT 重复：无（NEW）
 
-- [ ] Task 31: [E-019 / F-005] [P1] 重写被删 orchestrator 测试
+- [x] Task 31: [E-019 / F-005] [P1] 重写被删 orchestrator 测试
   - 修复目标：`crates/server/tests/orchestrator_test.rs` 重写对齐当前契约：① `run_streaming_stops_when_receiver_dropped`（期望 `Ok(Error)` 而非 `Err`，守护 D-006/B-003）；② `run_once_propagates_llm_stream_error`（断言 `matches!(event, Error { .. })` + 验证 message 内容，守护 D-004）；③ `run_once_invalid_tool_arguments_returns_tool_result_error`（期望 message 含 `"invalid tool input"`，守护 D-012）；3 个测试均通过。
   - 受影响：`crates/server/tests/orchestrator_test.rs`
   - 可并行：是
