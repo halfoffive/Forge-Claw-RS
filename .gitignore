@@ -23,7 +23,8 @@ target
 # ForgeClaw workspace
 /target
 /web/node_modules
-/web/dist
+/web/dist/*
+!/web/dist/.gitkeep
 /.pnpm-store
 
 # Editor swap files

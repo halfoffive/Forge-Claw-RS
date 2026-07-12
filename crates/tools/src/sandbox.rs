@@ -1,4 +1,10 @@
 //! `Sandbox`：工具注册 + 分层安全调度（Critical 拦截 / Confirm 确认 / Allow 放行）。
+//!
+//! 平台相关说明：
+//! - Linux：在 `ShellTool` 启动子进程前，通过 landlock（Linux 5.13+）将文件系统访问
+//!   严格限制在工作目录内，并拒绝外联 TCP 连接（内核 6.7+）。不支持 landlock 的内核会
+//!   优雅降级到现有的 `current_dir` + `is_within` 检查。
+//! - 非 Linux：当前仅通过 `current_dir` 与 `is_within` 限制路径，尚未引入内核级沙箱。
 
 use std::path::{Path, PathBuf};
 
@@ -84,6 +90,91 @@ impl Sandbox {
 /// 默认确认器：总是放行（供测试与默认场景）。
 pub fn auto_confirm() -> Confirmer {
     Box::new(|_name: &str, _input: &Value| true)
+}
+
+/// Linux 下使用 landlock 在**当前线程/进程**建立文件系统 + 网络沙箱。
+///
+/// 应在 `fork` 之后、`exec` 之前的子进程中调用（例如 `std::os::unix::process::CommandExt::pre_exec`），
+/// 以免限制父进程。非 Linux 平台无此函数。
+///
+/// 策略：
+/// - 工作目录：读、写、执行；
+/// - `/` 及必要系统目录（`/bin`、`/usr`、`/lib` 等）：读 + 执行，仅用于加载 `sh`、动态库；
+/// - `/dev/null`：读写，用于常见重定向；
+/// - 不添加任何网络规则，因此所有 TCP 连接/绑定被拒绝（内核 6.7+）。
+///
+/// 若内核不支持 landlock，则记录警告并返回 `Ok(())`，由调用方继续执行现有 cwd 检查。
+#[cfg(target_os = "linux")]
+pub fn apply_landlock(working_dir: &Path) -> anyhow::Result<()> {
+    use landlock::{
+        Access, AccessFs, AccessNet, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, ABI,
+    };
+
+    // ABI::V4 引入 TCP connect/bind；若内核不支持，BestEffort 兼容性会自动降级。
+    let abi = ABI::V4;
+    let fs_all = AccessFs::from_all(abi);
+    let fs_rx = AccessFs::from_read(abi) | AccessFs::Execute;
+    let net_all = AccessNet::from_all(abi);
+
+    let mut ruleset = Ruleset::default()
+        .handle_access(fs_all)?
+        .handle_access(net_all)?
+        .create()?;
+
+    // 工作目录：完全访问。
+    let wd_fd = PathFd::new(working_dir)
+        .map_err(|e| anyhow::anyhow!("failed to open working_dir for landlock: {}", e))?;
+    ruleset = ruleset.add_rule(PathBeneath::new(wd_fd, fs_all))?;
+
+    // `/`：仅允许遍历，避免过度开放根目录列表。
+    if let Ok(fd) = PathFd::new(Path::new("/")) {
+        ruleset = ruleset.add_rule(PathBeneath::new(fd, AccessFs::Execute))?;
+    }
+
+    // 运行 /bin/sh、动态链接器及读取 /etc/ld.so.cache 等所需的系统路径。
+    let system_paths: &[&Path] = &[
+        Path::new("/bin"),
+        Path::new("/sbin"),
+        Path::new("/usr"),
+        Path::new("/lib"),
+        Path::new("/lib64"),
+        Path::new("/usr/lib"),
+        Path::new("/usr/lib64"),
+        Path::new("/etc"),
+    ];
+    for p in system_paths {
+        if let Ok(fd) = PathFd::new(p) {
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, fs_rx))?;
+        }
+    }
+
+    // /dev/null：允许读写，供常见重定向使用；/dev 仅允许遍历。
+    if let Ok(fd) = PathFd::new(Path::new("/dev")) {
+        ruleset = ruleset.add_rule(PathBeneath::new(fd, AccessFs::Execute))?;
+    }
+    if let Ok(fd) = PathFd::new(Path::new("/dev/null")) {
+        ruleset = ruleset.add_rule(PathBeneath::new(
+            fd,
+            AccessFs::from_read(abi) | AccessFs::WriteFile,
+        ))?;
+    }
+
+    let status = ruleset.restrict_self()?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            tracing::debug!(path = %working_dir.display(), "landlock fully enforced");
+        }
+        RulesetStatus::PartiallyEnforced => {
+            tracing::warn!(path = %working_dir.display(), "landlock partially enforced");
+        }
+        RulesetStatus::NotEnforced => {
+            tracing::warn!(
+                "landlock not supported by this kernel (requires Linux 5.13+); falling back to cwd check"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
