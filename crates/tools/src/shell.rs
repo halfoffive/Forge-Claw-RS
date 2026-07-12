@@ -200,7 +200,7 @@ impl Tool for ShellTool {
                 unsafe {
                     child.pre_exec(move || {
                         crate::sandbox::apply_landlock(&landlock_dir).map_err(|e| {
-                            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                            std::io::Error::other(e.to_string())
                         })
                     });
                 }

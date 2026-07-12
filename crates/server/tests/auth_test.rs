@@ -654,7 +654,7 @@ fn find_by_token_timing_is_independent_of_token_existence() {
 
     let ratio = valid_duration.as_secs_f64() / invalid_duration.as_secs_f64().max(1e-9);
     assert!(
-        ratio >= 0.25 && ratio <= 4.0,
+        (0.25..=4.0).contains(&ratio),
         "valid/invalid lookup time ratio {ratio} is outside expected range; \
          valid={valid_duration:?}, invalid={invalid_duration:?}"
     );

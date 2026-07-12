@@ -229,7 +229,7 @@ fn set_windows_owner_only_dacl(path: &std::path::Path) -> anyhow::Result<()> {
 
         // 创建新 DACL（丢弃原有 ACE）。
         let mut acl: *mut ACL = null_mut();
-        let err = SetEntriesInAclW(1, &mut explicit_access, null_mut(), &mut acl);
+        let err = SetEntriesInAclW(1, &explicit_access, null_mut(), &mut acl);
         if err != 0 {
             anyhow::bail!("SetEntriesInAclW failed: {}", err);
         }
