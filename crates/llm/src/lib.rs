@@ -48,15 +48,26 @@ impl Role {
     }
 }
 
-impl From<&str> for Role {
-    fn from(s: &str) -> Self {
+/// 未知 role 字符串错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownRoleError(String);
+
+impl std::fmt::Display for UnknownRoleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown role: {}", self.0)
+    }
+}
+
+impl TryFrom<&str> for Role {
+    type Error = UnknownRoleError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
-            "system" => Role::System,
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            "tool" => Role::Tool,
-            // 未知值回落为 user（不致命，避免 infallible 转换 panic）。
-            _ => Role::User,
+            "system" => Ok(Role::System),
+            "user" => Ok(Role::User),
+            "assistant" => Ok(Role::Assistant),
+            "tool" => Ok(Role::Tool),
+            _ => Err(UnknownRoleError(s.to_string())),
         }
     }
 }
@@ -327,5 +338,20 @@ mod tests {
         assert!(j.contains("\"tool_call_id\":\"call_1\""));
         assert!(j.contains("\"role\":\"tool\""));
         assert!(!j.contains("tool_calls"));
+    }
+
+    #[test]
+    fn role_try_from_known_roles() {
+        assert_eq!(Role::try_from("system"), Ok(Role::System));
+        assert_eq!(Role::try_from("user"), Ok(Role::User));
+        assert_eq!(Role::try_from("assistant"), Ok(Role::Assistant));
+        assert_eq!(Role::try_from("tool"), Ok(Role::Tool));
+    }
+
+    #[test]
+    fn role_try_from_unknown_role_does_not_fall_back_to_user() {
+        let result = Role::try_from("developer");
+        assert!(result.is_err());
+        assert_ne!(result.ok(), Some(Role::User));
     }
 }

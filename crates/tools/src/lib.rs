@@ -11,7 +11,7 @@ pub mod search;
 pub mod shell;
 
 pub use file::{is_within, FileReadTool, FileWriteTool};
-pub use sandbox::{auto_confirm, Confirmer, Sandbox};
+pub use sandbox::{auto_confirm, channel_confirmer, confirmer_from_fn, AsyncConfirmer, Sandbox};
 pub use search::{GrepTool, SearchTool};
 pub use shell::ShellTool;
 

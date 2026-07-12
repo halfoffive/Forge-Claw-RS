@@ -37,6 +37,24 @@ pub fn is_within(path: &Path, base: &Path) -> bool {
     canon_path.starts_with(&canon_base)
 }
 
+/// 规范化用于写入的目标路径，并确认其仍位于 `base` 目录内。
+///
+/// 返回的是绝对、已解析符号链接的路径，可直接用于后续写入，避免在检查
+/// 与写入之间重新解析原始路径，从而关闭 TOCTOU 符号链接替换窗口。
+fn canonicalize_write_path(path: &Path, base: &Path) -> Option<PathBuf> {
+    let canon_base = base.canonicalize().ok()?;
+    let canon_path = path.canonicalize().ok().or_else(|| {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+        let canon_parent = parent.canonicalize().ok()?;
+        path.file_name().map(|name| canon_parent.join(name))
+    })?;
+    if canon_path.starts_with(&canon_base) {
+        Some(canon_path)
+    } else {
+        None
+    }
+}
+
 /// 判断路径是否落在敏感目录（即使在 working_dir 内也拒绝写入）。
 fn is_sensitive_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
@@ -207,6 +225,9 @@ impl Tool for FileWriteTool {
         if is_sensitive_path(&path) {
             return SafetyLevel::Critical;
         }
+        if !is_within(&path, &self.working_dir) {
+            return SafetyLevel::Critical;
+        }
         SafetyLevel::Confirm
     }
 
@@ -223,11 +244,12 @@ impl Tool for FileWriteTool {
         if is_sensitive_path(&path) {
             return Ok(blocked("sensitive path"));
         }
-        if !is_within(&path, &self.working_dir) {
-            return Ok(blocked("path outside working directory"));
-        }
+        let safe_path = match canonicalize_write_path(&path, &self.working_dir) {
+            Some(p) => p,
+            None => return Ok(blocked("path outside working directory")),
+        };
         let start = std::time::Instant::now();
-        match tokio::fs::write(&path, content).await {
+        match tokio::fs::write(&safe_path, content).await {
             Ok(()) => Ok(ToolResult {
                 output: format!("wrote {} bytes to {}", content.len(), path.display()),
                 error: None,
@@ -370,5 +392,59 @@ mod tests {
         let tool = FileWriteTool::new(dir.path().to_path_buf());
         let lvl = tool.check(&json!({"path": "ok.txt", "content": "y"})).await;
         assert_eq!(lvl, SafetyLevel::Confirm);
+    }
+
+    #[tokio::test]
+    async fn write_check_outside_is_critical() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let tool = FileWriteTool::new(dir.path().to_path_buf());
+        let target = outside.path().join("x.txt");
+        let lvl = tool
+            .check(&json!({"path": target.to_string_lossy().to_string(), "content": "y"}))
+            .await;
+        assert_eq!(lvl, SafetyLevel::Critical);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_symlink_inside_succeeds() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "original").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&real, &link).unwrap();
+        let tool = FileWriteTool::new(dir.path().to_path_buf());
+        let r = tool
+            .execute(json!({"path": "link.txt", "content": "updated"}))
+            .await
+            .unwrap();
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "updated");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_symlink_replaced_to_outside_blocked() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let inside_file = dir.path().join("inside.txt");
+        std::fs::write(&inside_file, "inside").unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&inside_file, &link).unwrap();
+        // 模拟检查通过后、写入前符号链接被替换为指向外部路径。
+        std::fs::remove_file(&link).unwrap();
+        symlink(&outside_file, &link).unwrap();
+        let tool = FileWriteTool::new(dir.path().to_path_buf());
+        let r = tool
+            .execute(json!({"path": "link.txt", "content": "attacker"}))
+            .await
+            .unwrap();
+        assert!(r.error.unwrap().contains("blocked"));
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "outside");
     }
 }

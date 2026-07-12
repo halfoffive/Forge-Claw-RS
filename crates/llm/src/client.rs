@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use serde::Deserialize;
 
-use crate::{ChatRequest, Event};
+use crate::{ChatRequest, Event, Role};
 
 // ============ LlmClient trait ============
 
@@ -36,6 +36,8 @@ struct StreamChoice {
 
 #[derive(Debug, Default, Deserialize)]
 struct StreamDelta {
+    #[serde(default)]
+    role: Option<String>,
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
@@ -97,6 +99,12 @@ pub fn parse_sse_events(data: &str) -> Vec<Event> {
 fn chunk_to_events(chunk: StreamChunk) -> Vec<Event> {
     let mut out = Vec::new();
     for choice in chunk.choices {
+        if let Some(role) = choice.delta.role {
+            if let Err(e) = Role::try_from(role.as_str()) {
+                tracing::warn!("unknown sse role: {e}");
+                continue;
+            }
+        }
         if let Some(c) = choice.delta.content {
             if !c.is_empty() {
                 out.push(Event::Delta(c));
@@ -349,6 +357,16 @@ mod tests {
     #[test]
     fn parse_sse_events_skips_invalid_json() {
         let sse = "data: not-json\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
+        let ev = parse_sse_events(sse);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0], Event::Delta("ok".into()));
+    }
+
+    #[test]
+    fn parse_sse_events_unknown_role_does_not_become_user() {
+        // 未知 role 不应被静默转换为 user，应跳过对应 choice。
+        let sse = "data: {\"choices\":[{\"delta\":{\"role\":\"unknown\",\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n";
         let ev = parse_sse_events(sse);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0], Event::Delta("ok".into()));

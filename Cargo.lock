@@ -525,6 +525,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -585,6 +605,7 @@ name = "forgeclaw"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "forgeclaw-core",
  "forgeclaw-llm",
@@ -593,11 +614,13 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -608,6 +631,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "uuid",
 ]
@@ -644,6 +668,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-http 0.7.0",
  "tower_governor",
@@ -659,6 +684,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "forgeclaw-core",
+ "landlock",
  "regex",
  "serde_json",
  "tempfile",
@@ -1257,6 +1283,17 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "635839550ae8b90d9fd2571460a6645dc0aec070225956ca7a2831ed31d2795d"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

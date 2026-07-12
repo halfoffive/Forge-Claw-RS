@@ -26,6 +26,10 @@ pub enum CoreError {
     /// profile 引用的 section 文件不存在。
     #[error("section not found: {0} (path: {1})")]
     SectionNotFound(String, PathBuf),
+
+    /// 非法 profile / section 名（含路径遍历字符或空）。
+    #[error("invalid name: {0}")]
+    InvalidName(String),
 }
 
 /// core crate 统一 Result 别名。

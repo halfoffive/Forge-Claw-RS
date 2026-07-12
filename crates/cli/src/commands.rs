@@ -13,15 +13,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::bail;
+use async_trait::async_trait;
 use forgeclaw_core::prompt::PromptEngine;
-use forgeclaw_llm::{FunctionSpec, History, LlmClient, OpenAiClient, ToolSpec};
+use forgeclaw_llm::{History, LlmClient, OpenAiClient};
 use forgeclaw_server::{
-    build_orchestrator as build_server_orchestrator, run as server_run, AppState, Orchestrator,
-    OrchestratorConfig, OrchestratorEvent, UserStore,
+    build_orchestrator as build_server_orchestrator, default_sandbox_with_specs, run as server_run,
+    AppState, Orchestrator, OrchestratorConfig, OrchestratorEvent, UserStore,
 };
-use forgeclaw_tools::{
-    Confirmer, FileReadTool, FileWriteTool, GrepTool, Sandbox, SearchTool, ShellTool, Tool,
-};
+use forgeclaw_tools::{AsyncConfirmer, Sandbox};
 
 use crate::config::Config;
 
@@ -58,73 +57,53 @@ fn build_orchestrator(cfg: &Config, auto_apply: bool) -> anyhow::Result<Arc<Orch
     build_orchestrator_confirm(cfg)
 }
 
-/// confirm 模式：5 工具 + stdin 确认器（复制 server 的工具注册与 spec 描述，
-/// 因 `Sandbox` 不暴露 confirmer 替换接口）。
+/// CLI confirm 模式使用的 stdin 确认器：在 `spawn_blocking` 中读取用户输入，
+/// 避免阻塞 async runtime。
+struct StdinConfirmer;
+
+#[async_trait]
+impl AsyncConfirmer for StdinConfirmer {
+    async fn confirm(&self, name: &str, input: &serde_json::Value) -> bool {
+        let name = name.to_string();
+        let input = input.clone();
+        tokio::task::spawn_blocking(move || {
+            eprintln!();
+            eprintln!("{YELLOW}[确认] 工具调用: {name}{RESET}");
+            eprintln!(
+                "  输入: {}",
+                serde_json::to_string(&input).unwrap_or_default()
+            );
+            eprint!("允许执行? [y/N] ");
+            let _ = io::stderr().flush();
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(_) => line.trim().eq_ignore_ascii_case("y"),
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+/// confirm 模式：复用 server 默认沙箱与工具 spec 描述，仅替换确认器为 stdin。
 fn build_orchestrator_confirm(cfg: &Config) -> anyhow::Result<Arc<Orchestrator>> {
     let llm: Arc<dyn LlmClient> = Arc::new(OpenAiClient::new(
         cfg.base_url.clone(),
         cfg.api_key.clone(),
     )?);
     let working_dir = cfg.working_dir.clone();
-    let shell = ShellTool::new(working_dir.clone());
-    let read = FileReadTool::new(working_dir.clone());
-    let write = FileWriteTool::new(working_dir.clone());
-    let search = SearchTool::new(working_dir.clone());
-    let grep = GrepTool::new(working_dir.clone());
-    let specs = vec![
-        spec_for(&shell, "Execute shell commands in the working directory"),
-        spec_for(&read, "Read a file from the working directory"),
-        spec_for(&write, "Write content to a file in the working directory"),
-        spec_for(
-            &search,
-            "Search files by glob pattern in the working directory",
-        ),
-        spec_for(
-            &grep,
-            "Grep file contents by regex in the working directory",
-        ),
-    ];
-    let confirmer: Confirmer = Box::new(|name: &str, input: &serde_json::Value| {
-        eprintln!();
-        eprintln!("{YELLOW}[确认] 工具调用: {name}{RESET}");
-        eprintln!(
-            "  输入: {}",
-            serde_json::to_string(input).unwrap_or_default()
-        );
-        eprint!("允许执行? [y/N] ");
-        let _ = io::stderr().flush();
-        let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(_) => line.trim().eq_ignore_ascii_case("y"),
-            Err(_) => false,
-        }
-    });
-    let mut sb = Sandbox::new(working_dir.clone(), confirmer);
-    sb.register(Box::new(shell));
-    sb.register(Box::new(read));
-    sb.register(Box::new(write));
-    sb.register(Box::new(search));
-    sb.register(Box::new(grep));
+    let (mut sandbox, specs) = default_sandbox_with_specs(working_dir.clone());
+    sandbox.with_confirmer(Arc::new(StdinConfirmer));
     Ok(Arc::new(Orchestrator::new(
         llm,
-        Arc::new(sb),
+        Arc::new(sandbox),
         specs,
         cfg.prompts_root.clone(),
         cfg.profile.clone(),
         cfg.model.clone(),
         working_dir,
     )))
-}
-
-fn spec_for(tool: &dyn Tool, description: &str) -> ToolSpec {
-    ToolSpec {
-        typ: "function".to_string(),
-        function: FunctionSpec {
-            name: tool.name().to_string(),
-            description: description.to_string(),
-            parameters: tool.schema(),
-        },
-    }
 }
 
 /// 与 orchestrator.prompt_vars 一致的变量注入（tools/model/cwd）。
@@ -268,11 +247,11 @@ fn print_stream_event(ev: &OrchestratorEvent) {
             print!("{CYAN}{text}{RESET}");
             let _ = io::stdout().flush();
         }
-        OrchestratorEvent::ToolCallStart { name, input } => {
+        OrchestratorEvent::ToolCallStart { name, input, .. } => {
             println!("\n{YELLOW}[tool] {name}: {input}{RESET}");
             let _ = io::stdout().flush();
         }
-        OrchestratorEvent::ToolResult { name, result } => {
+        OrchestratorEvent::ToolResult { name, result, .. } => {
             if let Some(err) = &result.error {
                 println!("{RED}[result] {name}: error: {err}{RESET}");
             } else {
@@ -323,9 +302,9 @@ pub async fn run_run(cfg: Config, task: String, auto_apply: bool) -> anyhow::Res
 // ============ prompt ============
 
 pub async fn run_prompt_compile(cfg: Config, profile: String) -> anyhow::Result<()> {
-    let mut engine = PromptEngine::new(cfg.prompts_root.clone());
+    let engine = PromptEngine::new(cfg.prompts_root.clone());
     let vars = prompt_vars(&cfg);
-    let prompt = engine.compile(&profile, &vars)?;
+    let prompt = engine.compile(&profile, &vars).await?;
     print!("{prompt}");
     if !prompt.ends_with('\n') {
         println!();

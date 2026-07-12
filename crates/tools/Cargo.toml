@@ -16,5 +16,10 @@ serde_json = { workspace = true }
 walkdir = "2.5"
 regex = "1.11"
 
+# landlock 是 Linux 5.13+ 内核特性，该 crate 无法在非 Linux 平台编译。
+# 使用 target-specific 依赖可在 Linux 下自动启用，同时保持 Windows/macOS 可编译。
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 tempfile = "3.20"

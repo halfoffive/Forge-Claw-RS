@@ -1,40 +1,46 @@
-/* ForgeClaw WebUI 全局样式：设计 token + 基础重置。 */
+/* ForgeClaw WebUI 全局样式：工业 / 炽热母题设计 token + 基础重置。 */
 
 :root {
-  /* 颜色 */
-  --color-bg: #ffffff;
-  --color-surface: #f7f7f8;
-  --color-text: #1f2024;
-  --color-muted: #8a8f98;
-  --color-border: #e5e5ea;
-  --color-primary: #7c5cff;
-  --color-danger: #e5484d;
+  /* 工业炽热调色板（默认深色）。 */
+  --color-bg: #0f1013;
+  --color-surface: #181920;
+  --color-surface-elevated: #1f2129;
+  --color-text: #f3f4f6;
+  --color-muted: #9ca3af;
+  --color-border: #2e303a;
+  --color-primary: #f59e0b;
+  --color-primary-glow: rgba(245, 158, 11, 0.28);
+  --color-danger: #ef4444;
 
-  /* 间距 / 圆角 / 字体 */
+  /* 间距 / 圆角 / 字体。 */
   --space: 16px;
-  --radius: 8px;
-  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+  --radius: 10px;
+  --font-sans: 'Outfit', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Consolas, monospace;
 
-  font: 14px/1.5 var(--font-sans);
+  font: 15px/1.55 var(--font-sans);
   color: var(--color-text);
   background: var(--color-bg);
-  color-scheme: light dark;
+  color-scheme: dark;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-@media (prefers-color-scheme: dark) {
+@media (prefers-color-scheme: light) {
   :root {
-    --color-bg: #16171d;
-    --color-surface: #1f2028;
-    --color-text: #f3f4f6;
-    --color-muted: #9ca3af;
-    --color-border: #2e303a;
-    --color-primary: #a78bfa;
-    --color-danger: #ff6b6b;
+    --color-bg: #f8f7f5;
+    --color-surface: #ffffff;
+    --color-surface-elevated: #f1f0ee;
+    --color-text: #1f2024;
+    --color-muted: #6b7280;
+    --color-border: #e2e2e6;
+    --color-primary: #d97706;
+    --color-primary-glow: rgba(217, 119, 6, 0.22);
+    --color-danger: #dc2626;
+
+    color-scheme: light;
   }
 }
 
@@ -60,4 +66,79 @@ a {
 
 button {
   font-family: inherit;
+}
+
+input,
+textarea {
+  font-family: inherit;
+}
+
+/* 登录页：炽热径向光晕与工业钢印卡片。 */
+.login {
+  position: relative;
+  background:
+    radial-gradient(circle at 15% 25%, rgba(245, 158, 11, 0.14) 0%, transparent 36%),
+    radial-gradient(circle at 85% 75%, rgba(239, 68, 68, 0.09) 0%, transparent 36%),
+    var(--color-bg);
+}
+
+.login .card {
+  position: relative;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow:
+    0 24px 70px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  overflow: hidden;
+}
+
+.login .card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--color-primary), #ef4444, transparent);
+}
+
+.login .title {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.login .submit {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  box-shadow: 0 4px 20px var(--color-primary-glow);
+}
+
+/* 代码高亮基础。 */
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+pre {
+  margin: 0;
+}
+
+/* 工业风滚动条。 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-muted);
 }

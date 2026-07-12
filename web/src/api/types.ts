@@ -83,8 +83,8 @@ export interface ToolInfo {
  */
 export type OrchestratorEvent =
   | { type: 'delta'; text: string }
-  | { type: 'tool_call_start'; name: string; input: unknown }
-  | { type: 'tool_result'; name: string; result: ToolResult }
+  | { type: 'tool_call_start'; call_id: string; name: string; input: unknown }
+  | { type: 'tool_result'; call_id: string; name: string; result: ToolResult }
   | { type: 'complete'; text: string; tool_calls: ToolCallRecord[] }
   | { type: 'error'; message: string }
 
