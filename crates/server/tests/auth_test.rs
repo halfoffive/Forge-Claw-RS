@@ -1,10 +1,11 @@
-//! 鉴权集成测试：覆盖中间件 401、login 端点、用户会话隔离、WS query token 鉴权。
+//! 鉴权集成测试：覆盖中间件 401、login 端点、用户会话隔离、WS query token 鉴权、WS 消息流。
 //!
 //! 用 `tower::ServiceExt::oneshot` 发请求，不打真实 LLM API（MockClient 返回空 Done）。
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
@@ -14,36 +15,46 @@ use forgeclaw_core::model::Session;
 use forgeclaw_llm::{ChatRequest, Event, History, LlmClient};
 use forgeclaw_server::{app, AppState, Orchestrator, SessionData, UserStore};
 use futures::stream::BoxStream;
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tempfile::tempdir;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::connect_async;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const ALICE_TOKEN: &str = "alice-token";
 const BOB_TOKEN: &str = "bob-token";
 
-/// 脚本化 Mock LLM 客户端：返回空 Done 流（本测试套不触发 chat）。
+/// 脚本化 Mock LLM 客户端：每次 `chat` 返回同一组事件。
 struct MockClient {
+    events: Vec<Event>,
     counter: AtomicUsize,
+}
+
+impl MockClient {
+    fn new(events: Vec<Event>) -> Self {
+        Self {
+            events,
+            counter: AtomicUsize::new(0),
+        }
+    }
 }
 
 #[async_trait]
 impl LlmClient for MockClient {
     async fn chat(&self, _req: ChatRequest) -> anyhow::Result<BoxStream<'static, Event>> {
         self.counter.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::pin(futures::stream::iter(vec![Event::Done])))
+        Ok(Box::pin(futures::stream::iter(self.events.clone())))
     }
 }
 
 /// 构造带两个用户（alice/bob）的 AppState。
-fn build_state() -> (AppState, tempfile::TempDir) {
+fn build_state_with_llm(llm: Arc<dyn LlmClient>) -> (AppState, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let (sandbox, specs) = forgeclaw_server::default_sandbox_with_specs(dir.path().to_path_buf());
     let prompts_root =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../prompts/profiles");
-    let llm: Arc<dyn LlmClient> = Arc::new(MockClient {
-        counter: AtomicUsize::new(0),
-    });
     let orch = Orchestrator::new(
         llm,
         Arc::new(sandbox),
@@ -65,6 +76,10 @@ fn build_state() -> (AppState, tempfile::TempDir) {
         ),
         dir,
     )
+}
+
+fn build_state() -> (AppState, tempfile::TempDir) {
+    build_state_with_llm(Arc::new(MockClient::new(vec![Event::Done])))
 }
 
 async fn body_to_json(body: Body) -> Value {
@@ -374,4 +389,120 @@ async fn ws_with_valid_ticket_passes_auth() {
     // （ConnectionNotUpgradable）。关键：不是 401，证明 ticket 校验已通过。
     assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+}
+
+// ============ WebSocket 真实消息流集成测试 ============
+
+type TestWs = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+async fn start_server(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
+    });
+    (addr, handle)
+}
+
+async fn connect_ws(addr: SocketAddr, ticket: &str) -> TestWs {
+    let url = format!("ws://127.0.0.1:{}/ws/chat?ticket={}", addr.port(), ticket);
+    let (ws, _) = connect_async(url).await.unwrap();
+    ws
+}
+
+async fn recv_text(ws: &mut TestWs) -> String {
+    loop {
+        match ws.next().await.unwrap().unwrap() {
+            WsMessage::Text(text) => return text.to_string(),
+            WsMessage::Ping(_) => ws.send(WsMessage::Pong(vec![].into())).await.unwrap(),
+            other => panic!("unexpected ws message: {:?}", other),
+        }
+    }
+}
+
+#[tokio::test]
+async fn ws_invalid_session_id_returns_error_frame() {
+    let (state, _dir) = build_state();
+    let alice = state.user_store.find_by_name("alice").expect("user exists");
+    let ticket = state.issue_ticket(alice.id);
+    let (addr, handle) = start_server(state).await;
+
+    let mut ws = connect_ws(addr, &ticket).await;
+    ws.send(WsMessage::Text(
+        r#"{"message":"hi","session_id":"not-a-uuid"}"#.into(),
+    ))
+    .await
+    .unwrap();
+
+    let text = recv_text(&mut ws).await;
+    let ev: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ev["type"], "error");
+    assert_eq!(ev["message"], "invalid session_id");
+
+    let _ = ws.close(None).await;
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ws_orchestrator_error_returns_error_frame() {
+    let llm: Arc<dyn LlmClient> = Arc::new(MockClient::new(vec![Event::Error("boom".into())]));
+    let (state, _dir) = build_state_with_llm(llm);
+    let alice = state.user_store.find_by_name("alice").expect("user exists");
+    let ticket = state.issue_ticket(alice.id);
+    let (addr, handle) = start_server(state).await;
+
+    let mut ws = connect_ws(addr, &ticket).await;
+    ws.send(WsMessage::Text(r#"{"message":"hi"}"#.into()))
+        .await
+        .unwrap();
+
+    let text = recv_text(&mut ws).await;
+    let ev: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ev["type"], "error");
+    assert!(ev["message"].as_str().unwrap().contains("boom"));
+
+    let _ = ws.close(None).await;
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ws_timeout_aborts_task_and_returns_error_frame() {
+    // 让 LLM 永远挂起，验证任务超时后收到 Error 帧且不会无限阻塞。
+    struct SleepClient;
+
+    #[async_trait]
+    impl LlmClient for SleepClient {
+        async fn chat(&self, _req: ChatRequest) -> anyhow::Result<BoxStream<'static, Event>> {
+            Ok(Box::pin(futures::stream::once(async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Event::Done
+            })))
+        }
+    }
+
+    std::env::set_var("FORGECLAW_WS_TASK_TIMEOUT_SECS", "1");
+    let (state, _dir) = build_state_with_llm(Arc::new(SleepClient));
+    let alice = state.user_store.find_by_name("alice").expect("user exists");
+    let ticket = state.issue_ticket(alice.id);
+    let (addr, handle) = start_server(state).await;
+
+    let mut ws = connect_ws(addr, &ticket).await;
+    ws.send(WsMessage::Text(r#"{"message":"hi"}"#.into()))
+        .await
+        .unwrap();
+
+    let text = tokio::time::timeout(Duration::from_secs(5), recv_text(&mut ws))
+        .await
+        .expect("should receive error frame before 5s");
+    let ev: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ev["type"], "error");
+    assert_eq!(ev["message"], "orchestrator task timed out");
+
+    let _ = ws.close(None).await;
+    handle.abort();
+    std::env::remove_var("FORGECLAW_WS_TASK_TIMEOUT_SECS");
 }

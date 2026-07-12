@@ -229,6 +229,79 @@ async fn run_streaming_emits_delta_toolcall_toolresult_complete() {
 }
 
 #[tokio::test]
+async fn run_streaming_same_name_tool_calls_match_by_call_id() {
+    // 并发两个同名 read 工具调用，验证 ToolCallStart/ToolResult 的 call_id 一一对应。
+    let scripts = vec![
+        vec![
+            Event::ToolCallDelta {
+                index: 0,
+                id: Some("call_a".into()),
+                name: Some("read".into()),
+                arguments: Some("{\"path\":\"a.txt\"}".into()),
+            },
+            Event::ToolCallDelta {
+                index: 1,
+                id: Some("call_b".into()),
+                name: Some("read".into()),
+                arguments: Some("{\"path\":\"b.txt\"}".into()),
+            },
+        ],
+        vec![Event::Delta("done".into()), Event::Done],
+    ];
+    let (orch, dir) = build_orch(scripts);
+    std::fs::write(dir.path().join("a.txt"), "A").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "B").unwrap();
+
+    let mut history = History::with_system("sys");
+    let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(64);
+    let orch_arc = Arc::new(orch);
+    let handle = {
+        let orch = orch_arc.clone();
+        tokio::spawn(async move { orch.run_streaming(&mut history, "go".into(), tx).await })
+    };
+
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        let is_complete = matches!(ev, OrchestratorEvent::Complete { .. });
+        events.push(ev);
+        if is_complete {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            OrchestratorEvent::ToolCallStart { call_id, name, .. } => {
+                Some((call_id.clone(), name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            OrchestratorEvent::ToolResult { call_id, result, .. } => {
+                Some((call_id.clone(), result.output.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(starts.len(), 2);
+    assert_eq!(results.len(), 2);
+    let start_ids: std::collections::HashSet<_> = starts.iter().map(|(id, _)| id).collect();
+    let result_ids: std::collections::HashSet<_> = results.iter().map(|(id, _)| id).collect();
+    assert_eq!(start_ids, result_ids);
+
+    for (id, output) in &results {
+        let expected = if id == "call_a" { "A" } else { "B" };
+        assert_eq!(output, expected, "call_id {id} result mismatch");
+    }
+}
+
+#[tokio::test]
 async fn dispatch_subagent_returns_summary() {
     let (orch, _dir) = build_orch(vec![vec![
         Event::Delta("explore-summary".into()),

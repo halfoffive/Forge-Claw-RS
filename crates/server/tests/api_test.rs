@@ -167,6 +167,28 @@ async fn post_api_prompts_compile_returns_prompt() {
 }
 
 #[tokio::test]
+async fn post_api_prompts_compile_invalid_name_returns_404() {
+    let (state, _dir) = build_state();
+    let body = serde_json::to_vec(&json!({"profile":"../etc"})).unwrap();
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/prompts/compile")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "profile not found");
+}
+
+#[tokio::test]
 async fn get_api_sessions_empty_returns_empty_array() {
     let (state, _dir) = build_state();
     let response = app(state)
@@ -225,6 +247,25 @@ async fn get_api_prompts_sections_returns_array() {
     let ids: Vec<&str> = arr.iter().map(|s| s["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"identity"));
     assert!(ids.contains(&"tools"));
+}
+
+#[tokio::test]
+async fn get_api_prompts_sections_invalid_name_returns_404() {
+    let (state, _dir) = build_state();
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/prompts/sections?profile=../etc")
+                .header("authorization", format!("Bearer {TEST_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "profile not found");
 }
 
 #[tokio::test]

@@ -43,6 +43,16 @@ const TASK_TIMEOUT: Duration = Duration::from_secs(300);
 /// WS 单帧/单消息大小上限（SRV-014）。
 const MAX_WS_FRAME_SIZE: usize = 256 * 1024;
 
+/// 读取任务超时，支持测试通过环境变量覆盖。
+fn task_timeout() -> Duration {
+    if let Ok(v) = std::env::var("FORGECLAW_WS_TASK_TIMEOUT_SECS") {
+        if let Ok(secs) = v.parse::<u64>() {
+            return Duration::from_secs(secs);
+        }
+    }
+    TASK_TIMEOUT
+}
+
 #[derive(Debug, Deserialize)]
 struct WsChatRequest {
     message: String,
@@ -161,11 +171,22 @@ async fn handle_text_frame(
         }
     };
 
-    let session_id = req
-        .session_id
-        .as_deref()
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let session_id = match req.session_id.as_deref() {
+        Some(s) => match Uuid::parse_str(s) {
+            Ok(id) => id,
+            Err(_) => {
+                let _ = send_event(
+                    out_tx,
+                    &OrchestratorEvent::Error {
+                        message: "invalid session_id".into(),
+                    },
+                )
+                .await;
+                return std::ops::ControlFlow::Continue(());
+            }
+        },
+        None => Uuid::new_v4(),
+    };
 
     // 取出或新建会话：只取共享 history Arc，不深拷 messages（R2-SRV-004）。
     // SRV-006：跨用户既存 session_id 发 Error 并 return，不创建不覆盖。
@@ -194,7 +215,7 @@ async fn handle_text_frame(
     // SRV-007：history 用 Arc<RwLock<History>> 共享，spawn 任务内持写锁跑 run_streaming，
     // 防止并发请求丢失更新。guard 在任务结束自动释放。
     let history_for_task = history_arc.clone();
-    let join = tokio::spawn(async move {
+    let mut join = tokio::spawn(async move {
         let mut guard = history_for_task.write().await;
         orch.run_streaming(&mut guard, user_msg, tx).await
     });
@@ -203,79 +224,150 @@ async fn handle_text_frame(
     let mut final_text = String::new();
     let mut final_tool_calls: Vec<ToolCallRecord> = Vec::new();
     let mut got_complete = false;
-    while let Some(event) = rx.recv().await {
-        if let OrchestratorEvent::Complete {
-            ref text,
-            ref tool_calls,
-        } = event
-        {
-            final_text = text.clone();
-            final_tool_calls = tool_calls.clone();
-            got_complete = true;
-        }
-        if send_event(out_tx, &event).await.is_err() {
-            break;
-        }
-        if matches!(
-            event,
-            OrchestratorEvent::Complete { .. } | OrchestratorEvent::Error { .. }
-        ) {
-            break;
+    let mut task_errored = false;
+
+    // P1-SRV-002：同时等待事件、任务完成、单轮超时；超时或断连时 abort 并回 Error 帧。
+    let timeout = tokio::time::sleep(task_timeout());
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(event) => {
+                        if let OrchestratorEvent::Complete {
+                            ref text,
+                            ref tool_calls,
+                        } = event
+                        {
+                            final_text = text.clone();
+                            final_tool_calls = tool_calls.clone();
+                            got_complete = true;
+                        }
+                        let is_terminal = matches!(
+                            event,
+                            OrchestratorEvent::Complete { .. } | OrchestratorEvent::Error { .. }
+                        );
+                        if send_event(out_tx, &event).await.is_err() {
+                            // 客户端已断开：停止生成并释放锁。
+                            join.abort();
+                            break;
+                        }
+                        if is_terminal {
+                            break;
+                        }
+                    }
+                    None => {
+                        // Orchestrator 已结束或通道关闭，等待 join 观察结果。
+                        match join.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                task_errored = true;
+                                tracing::error!(error = %e, "run_streaming failed");
+                                let _ = send_event(
+                                    out_tx,
+                                    &OrchestratorEvent::Error {
+                                        message: "orchestrator task failed".into(),
+                                    },
+                                )
+                                .await;
+                            }
+                            Err(_) => {
+                                task_errored = true;
+                                tracing::error!("orchestrator task panicked");
+                                let _ = send_event(
+                                    out_tx,
+                                    &OrchestratorEvent::Error {
+                                        message: "orchestrator task panicked".into(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            res = &mut join => {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        task_errored = true;
+                        tracing::error!(error = %e, "run_streaming failed");
+                        let _ = send_event(
+                            out_tx,
+                            &OrchestratorEvent::Error {
+                                message: "orchestrator task failed".into(),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        task_errored = true;
+                        tracing::error!("orchestrator task panicked");
+                        let _ = send_event(
+                            out_tx,
+                            &OrchestratorEvent::Error {
+                                message: "orchestrator task panicked".into(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                break;
+            }
+            _ = &mut timeout => {
+                tracing::error!("orchestrator task timed out after {:?}", task_timeout());
+                join.abort();
+                task_errored = true;
+                let _ = send_event(
+                    out_tx,
+                    &OrchestratorEvent::Error {
+                        message: "orchestrator task timed out".into(),
+                    },
+                )
+                .await;
+                break;
+            }
         }
     }
     drop(rx);
 
     // 回写会话。R2-SRV-004：append 新消息而非整体 insert，避免并发覆盖。
-    // P1-SRV-002：对 spawn 任务加超时，防止 WS 断开后任务仍持 history 写锁阻塞同 session 请求。
-    let res = tokio::time::timeout(TASK_TIMEOUT, join).await;
-    match res {
-        Ok(Ok(Ok(()))) => {
-            if got_complete {
-                let assistant_tool_calls: Vec<ToolCall> = final_tool_calls
-                    .iter()
-                    .map(|r| ToolCall {
-                        id: r.id.clone(),
-                        tool: r.name.clone(),
-                        input: r.input.clone(),
-                    })
-                    .collect();
-                let new_messages = vec![
-                    CoreMessage::User(user_msg_text),
-                    CoreMessage::Assistant(AssistantMsg {
-                        text: final_text,
-                        tool_calls: assistant_tool_calls,
-                    }),
-                ];
-                let mut sessions = state.sessions.write().await;
-                match sessions.get_mut(&session_id) {
-                    Some(d) => {
-                        d.session.messages.extend(new_messages);
-                    }
-                    None => {
-                        sessions.insert(
-                            session_id,
-                            SessionData {
-                                session: Session {
-                                    id: session_id,
-                                    created_at: Utc::now(),
-                                    messages: new_messages,
-                                },
-                                history: history_arc,
-                                user_id,
-                            },
-                        );
-                    }
-                }
+    if !task_errored && got_complete {
+        let assistant_tool_calls: Vec<ToolCall> = final_tool_calls
+            .iter()
+            .map(|r| ToolCall {
+                id: r.id.clone(),
+                tool: r.name.clone(),
+                input: r.input.clone(),
+            })
+            .collect();
+        let new_messages = vec![
+            CoreMessage::User(user_msg_text),
+            CoreMessage::Assistant(AssistantMsg {
+                text: final_text,
+                tool_calls: assistant_tool_calls,
+            }),
+        ];
+        let mut sessions = state.sessions.write().await;
+        match sessions.get_mut(&session_id) {
+            Some(d) => {
+                d.session.messages.extend(new_messages);
             }
-        }
-        Ok(Ok(Err(e))) => {
-            tracing::error!(error = %e, "run_streaming failed");
-        }
-        Ok(Err(_)) => {
-            tracing::error!("orchestrator task panicked");
-        }
-        Err(_) => {
-            tracing::error!("orchestrator task timed out after 300s");
+            None => {
+                sessions.insert(
+                    session_id,
+                    SessionData {
+                        session: Session {
+                            id: session_id,
+                            created_at: Utc::now(),
+                            messages: new_messages,
+                        },
+                        history: history_arc,
+                        user_id,
+                    },
+                );
+            }
         }
     }
 

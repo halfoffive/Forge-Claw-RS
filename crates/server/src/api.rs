@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use forgeclaw_core::error::CoreError;
 use forgeclaw_core::model::{AssistantMsg, Message, Session, ToolCall};
 use forgeclaw_llm::{History, ToolSpec};
 
@@ -96,6 +97,16 @@ fn internal_error(e: impl std::fmt::Display) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal server error".to_string(),
     )
+}
+
+/// 将提示词引擎错误映射为 HTTP 响应。
+/// 非法 profile/section 名对外脱敏为 404，但内部记录真实原因（A-004）。
+fn map_prompt_error(e: anyhow::Error) -> (StatusCode, String) {
+    if let Some(CoreError::InvalidName(name)) = e.downcast_ref::<CoreError>() {
+        tracing::warn!(name = %name, "invalid profile/section name");
+        return (StatusCode::NOT_FOUND, "profile not found".to_string());
+    }
+    internal_error(e)
 }
 
 // ============ DTO ============
@@ -316,7 +327,7 @@ pub async fn compile_prompt(
         .orchestrator
         .compile_prompt(&req.profile)
         .await
-        .map_err(internal_error)?;
+        .map_err(map_prompt_error)?;
     Ok(Json(CompilePromptResponseDto { prompt }))
 }
 
@@ -328,6 +339,6 @@ pub async fn list_sections(
         .orchestrator
         .list_sections(&q.profile)
         .await
-        .map_err(internal_error)?;
+        .map_err(map_prompt_error)?;
     Ok(Json(sections))
 }

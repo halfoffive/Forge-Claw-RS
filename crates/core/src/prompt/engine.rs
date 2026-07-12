@@ -44,7 +44,7 @@ impl PromptEngine {
 
     fn profile_path(&self, profile_name: &str) -> Result<PathBuf> {
         if !is_safe_name(profile_name) {
-            return Err(CoreError::ProfileNotFound(profile_name.to_string()));
+            return Err(CoreError::InvalidName(profile_name.to_string()));
         }
         Ok(self.profiles_root.join(format!("{profile_name}.toml")))
     }
@@ -69,7 +69,7 @@ impl PromptEngine {
         let mut sections = Vec::with_capacity(profile.sections.len());
         for (name, rel) in profile.sections {
             if !is_safe_name(&name) {
-                return Err(CoreError::SectionNotFound(name, rel));
+                return Err(CoreError::InvalidName(name));
             }
             let abs = base.join(&rel);
             let section = load_section_file(&abs).map_err(|e| match e {
@@ -277,11 +277,22 @@ mod tests {
         for bad in ["../etc", "a/b", "a\\b", "..", "a\x00b", "a.b"] {
             let err = engine.list_sections(bad).unwrap_err();
             assert!(
-                matches!(err, CoreError::ProfileNotFound(_)),
-                "expected ProfileNotFound for {:?}, got {:?}",
+                matches!(err, CoreError::InvalidName(_)),
+                "expected InvalidName for {:?}, got {:?}",
                 bad,
                 err
             );
         }
+    }
+
+    #[test]
+    fn compile_rejects_invalid_profile_name() {
+        let mut engine = PromptEngine::new(profiles_root());
+        let err = engine.compile("../etc", &vars()).unwrap_err();
+        assert!(
+            matches!(err, CoreError::InvalidName(ref name) if name == "../etc"),
+            "expected InvalidName(../etc), got {:?}",
+            err
+        );
     }
 }

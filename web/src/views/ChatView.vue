@@ -130,7 +130,7 @@ function onFrame(raw: string, assistantIdx: number): void {
     case 'tool_call_start': {
       // F-01: ToolCall 字段对齐后端 { id, tool, input }。
       const call: ToolCall = {
-        id: crypto.randomUUID(),
+        id: event.call_id,
         tool: event.name,
         input: event.input,
       }
@@ -140,16 +140,13 @@ function onFrame(raw: string, assistantIdx: number): void {
       break
     }
     case 'tool_result': {
-      // 回填最近一个同名且 result 为空的 Tool 消息。
+      // 按 call_id 回填对应 Tool 消息，支持并发同名工具调用。
       const result: ToolResult = event.result
       for (let i = session.currentMessages.length - 1; i >= 0; i--) {
         const m = session.currentMessages[i]
-        if ('Tool' in m && m.Tool[0].tool === event.name) {
-          const [, prev] = m.Tool
-          if (!prev.output && !prev.error) {
-            m.Tool[1] = result
-            break
-          }
+        if ('Tool' in m && m.Tool[0].id === event.call_id) {
+          m.Tool[1] = result
+          break
         }
       }
       break
@@ -207,6 +204,29 @@ function onEnter(e: KeyboardEvent): void {
   if (e.isComposing) return
   send()
 }
+
+type Segment =
+  | { type: 'text'; content: string }
+  | { type: 'code'; language: string; content: string }
+
+// 将助手回复拆分为普通文本段落与代码块，分别渲染。
+function parseSegments(text: string): Segment[] {
+  const segments: Segment[] = []
+  const regex = /```(\w*)\n?([\s\S]*?)```/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: 'text', content: text.slice(lastIndex, match.index) })
+    }
+    segments.push({ type: 'code', language: match[1] || '', content: match[2] })
+    lastIndex = regex.lastIndex
+  }
+  if (lastIndex < text.length) {
+    segments.push({ type: 'text', content: text.slice(lastIndex) })
+  }
+  return segments
+}
 </script>
 
 <template>
@@ -227,11 +247,21 @@ function onEnter(e: KeyboardEvent): void {
 
       <template v-for="(m, i) in messages" :key="i">
         <div v-if="'User' in m" class="msg user">
-          <div class="bubble">{{ m.User }}</div>
+          <div class="bubble">
+            <p class="text-segment">{{ m.User }}</p>
+          </div>
         </div>
 
         <div v-else-if="'Assistant' in m" class="msg assistant">
-          <pre v-if="m.Assistant.text" class="bubble">{{ m.Assistant.text }}</pre>
+          <div v-if="m.Assistant.text" class="bubble">
+            <template v-for="(seg, si) in parseSegments(m.Assistant.text)" :key="si">
+              <p v-if="seg.type === 'text'" class="text-segment">{{ seg.content }}</p>
+              <div v-else class="code-wrap">
+                <div v-if="seg.language" class="code-lang">{{ seg.language }}</div>
+                <pre class="code-block"><code>{{ seg.content }}</code></pre>
+              </div>
+            </template>
+          </div>
           <span v-else class="bubble pending">…</span>
         </div>
 
@@ -301,6 +331,7 @@ function onEnter(e: KeyboardEvent): void {
 }
 .dot[data-status='streaming'] {
   background: var(--color-primary);
+  box-shadow: 0 0 8px var(--color-primary-glow);
 }
 .dot[data-status='error'] {
   background: var(--color-danger);
@@ -311,16 +342,18 @@ function onEnter(e: KeyboardEvent): void {
   opacity: 0.7;
 }
 .ghost {
-  padding: 4px 10px;
+  padding: 5px 12px;
   font-size: 13px;
   color: var(--color-text);
   background: transparent;
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
   cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
 }
 .ghost:hover {
   border-color: var(--color-primary);
+  color: var(--color-primary);
 }
 .messages {
   flex: 1;
@@ -345,16 +378,22 @@ function onEnter(e: KeyboardEvent): void {
   max-width: 80%;
   padding: 10px 14px;
   border-radius: var(--radius);
-  font-size: 14px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
+  font-size: 15px;
+  line-height: 1.65;
   margin: 0;
   font-family: inherit;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.text-segment {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .msg.user .bubble {
   background: var(--color-primary);
-  color: #fff;
+  color: #1f2024;
 }
 .msg.assistant .bubble {
   background: var(--color-surface);
@@ -364,6 +403,31 @@ function onEnter(e: KeyboardEvent): void {
 .bubble.pending {
   color: var(--color-muted);
   font-style: italic;
+}
+.code-wrap {
+  overflow: hidden;
+  border-radius: calc(var(--radius) - 2px);
+  border: 1px solid var(--color-border);
+}
+.code-lang {
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted);
+  background: var(--color-surface-elevated);
+  border-bottom: 1px solid var(--color-border);
+}
+.code-block {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.55;
+  background: var(--color-bg);
+  color: var(--color-text);
 }
 .tool-card {
   width: 100%;
@@ -426,7 +490,7 @@ function onEnter(e: KeyboardEvent): void {
   flex: 1;
   resize: none;
   padding: 10px 12px;
-  font-size: 14px;
+  font-size: 15px;
   font-family: inherit;
   color: var(--color-text);
   background: var(--color-surface);
@@ -436,19 +500,40 @@ function onEnter(e: KeyboardEvent): void {
 }
 .input:focus {
   border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-glow);
 }
 .send {
-  padding: 0 18px;
-  font-size: 14px;
-  font-weight: 500;
-  color: #fff;
+  padding: 0 20px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #1f2024;
   background: var(--color-primary);
   border: none;
   border-radius: var(--radius);
   cursor: pointer;
+  transition: box-shadow 0.15s;
+}
+.send:hover:not(:disabled) {
+  box-shadow: 0 4px 18px var(--color-primary-glow);
 }
 .send:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+@media (max-width: 767px) {
+  .bar {
+    padding-left: 56px;
+  }
+  .bubble,
+  .tool-card {
+    max-width: 92%;
+  }
+  .composer {
+    flex-direction: column;
+  }
+  .send {
+    padding: 10px;
+  }
 }
 </style>

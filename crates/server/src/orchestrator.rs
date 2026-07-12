@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use forgeclaw_core::model::{Section, ToolResult};
 use forgeclaw_llm::{
-    ChatMessage, ChatRequest, Event, FunctionCallDto, FunctionSpec, History, LlmClient,
+    ChatMessage, ChatRequest, Event, FunctionCallDto, FunctionSpec, History, LlmClient, Role,
     ToolCallDto, ToolSpec,
 };
 use forgeclaw_tools::{
@@ -50,9 +50,17 @@ pub enum OrchestratorEvent {
     /// 文本增量。
     Delta { text: String },
     /// 工具调用开始（已聚合完整 input）。
-    ToolCallStart { name: String, input: Value },
+    ToolCallStart {
+        call_id: String,
+        name: String,
+        input: Value,
+    },
     /// 工具调用结果。
-    ToolResult { name: String, result: ToolResult },
+    ToolResult {
+        call_id: String,
+        name: String,
+        result: ToolResult,
+    },
     /// 一轮对话完成（最终助手文本 + 本轮所有工具调用记录）。
     Complete {
         text: String,
@@ -333,7 +341,7 @@ impl Orchestrator {
             } else {
                 let dtos: Vec<ToolCallDto> = tcs.values().map(ToolCallDto::from).collect();
                 ChatMessage {
-                    role: "assistant".into(),
+                    role: Role::Assistant,
                     content: text.clone(),
                     tool_calls: Some(dtos),
                     tool_call_id: None,
@@ -372,6 +380,7 @@ impl Orchestrator {
                         if let Some(tx) = tx {
                             if tx
                                 .send(OrchestratorEvent::ToolCallStart {
+                                    call_id: agg.id.clone(),
                                     name: agg.name.clone(),
                                     input: v.clone(),
                                 })
@@ -397,6 +406,7 @@ impl Orchestrator {
                         if let Some(tx) = tx {
                             if tx
                                 .send(OrchestratorEvent::ToolCallStart {
+                                    call_id: agg.id.clone(),
                                     name: agg.name.clone(),
                                     input: Value::Null,
                                 })
@@ -418,6 +428,7 @@ impl Orchestrator {
                 if let Some(tx) = tx {
                     if tx
                         .send(OrchestratorEvent::ToolResult {
+                            call_id: agg.id.clone(),
                             name: agg.name.clone(),
                             result: result.clone(),
                         })
@@ -442,7 +453,7 @@ impl Orchestrator {
                     result.output.clone()
                 };
                 let tool_msg = ChatMessage {
-                    role: "tool".into(),
+                    role: Role::Tool,
                     content,
                     tool_calls: None,
                     tool_call_id: Some(agg.id),

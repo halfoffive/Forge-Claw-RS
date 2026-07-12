@@ -7,24 +7,94 @@
 //! - 非 Linux：当前仅通过 `current_dir` 与 `is_within` 限制路径，尚未引入内核级沙箱。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use forgeclaw_core::model::{SafetyLevel, ToolResult};
 use serde_json::Value;
 
 use crate::{FileReadTool, FileWriteTool, GrepTool, SearchTool, ShellTool, Tool};
 
-/// 确认回调：`(tool_name, input) -> 是否放行`。
-pub type Confirmer = Box<dyn Fn(&str, &Value) -> bool + Send + Sync>;
+/// 异步确认器：`(tool_name, input) -> 是否放行`。
+///
+/// 由 `#[async_trait]` 展开为对象安全签名，可在 `Arc<dyn AsyncConfirmer>` 中使用。
+#[async_trait]
+pub trait AsyncConfirmer: Send + Sync {
+    async fn confirm(&self, name: &str, input: &Value) -> bool;
+}
+
+/// 总是放行的确认器（供测试与默认场景）。
+pub struct AutoConfirm;
+
+#[async_trait]
+impl AsyncConfirmer for AutoConfirm {
+    async fn confirm(&self, _name: &str, _input: &Value) -> bool {
+        true
+    }
+}
+
+/// 返回一个总是放行的 [`AsyncConfirmer`]。
+pub fn auto_confirm() -> Arc<dyn AsyncConfirmer> {
+    Arc::new(AutoConfirm)
+}
+
+/// 将同步闭包包装为 [`AsyncConfirmer`]（不阻塞 runtime，闭包本身需立即返回）。
+pub struct FnConfirmer<F> {
+    f: F,
+}
+
+#[async_trait]
+impl<F> AsyncConfirmer for FnConfirmer<F>
+where
+    F: Fn(&str, &Value) -> bool + Send + Sync + 'static,
+{
+    async fn confirm(&self, name: &str, input: &Value) -> bool {
+        (self.f)(name, input)
+    }
+}
+
+/// 用同步闭包构造确认器。
+pub fn confirmer_from_fn<F>(f: F) -> Arc<dyn AsyncConfirmer>
+where
+    F: Fn(&str, &Value) -> bool + Send + Sync + 'static,
+{
+    Arc::new(FnConfirmer { f })
+}
+
+/// 基于 tokio channel 的测试确认器：外部通过 sender 注入 `true/false`。
+pub struct ChannelConfirmer {
+    responses: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<bool>>,
+}
+
+#[async_trait]
+impl AsyncConfirmer for ChannelConfirmer {
+    async fn confirm(&self, _name: &str, _input: &Value) -> bool {
+        self.responses.lock().await.recv().await.unwrap_or(false)
+    }
+}
+
+/// 构造 channel 确认器及其控制端。
+pub fn channel_confirmer(
+    buffer: usize,
+) -> (Arc<dyn AsyncConfirmer>, tokio::sync::mpsc::Sender<bool>) {
+    let (tx, rx) = tokio::sync::mpsc::channel(buffer);
+    (
+        Arc::new(ChannelConfirmer {
+            responses: tokio::sync::Mutex::new(rx),
+        }),
+        tx,
+    )
+}
 
 /// 工具沙箱：持有工作目录、工具集合与确认回调。
 pub struct Sandbox {
     working_dir: PathBuf,
     tools: Vec<Box<dyn Tool>>,
-    confirmer: Confirmer,
+    confirmer: Arc<dyn AsyncConfirmer>,
 }
 
 impl Sandbox {
-    pub fn new(working_dir: PathBuf, confirmer: Confirmer) -> Self {
+    pub fn new(working_dir: PathBuf, confirmer: Arc<dyn AsyncConfirmer>) -> Self {
         Self {
             working_dir,
             tools: Vec::new(),
@@ -35,6 +105,12 @@ impl Sandbox {
     /// 注册一个工具。
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
+    }
+
+    /// 替换当前确认器，返回 `&mut self` 以便链式调用。
+    pub fn with_confirmer(&mut self, confirmer: Arc<dyn AsyncConfirmer>) -> &mut Self {
+        self.confirmer = confirmer;
+        self
     }
 
     /// 已注册工具名列表。
@@ -61,7 +137,7 @@ impl Sandbox {
                 duration_ms: 0,
             }),
             SafetyLevel::Confirm => {
-                if (self.confirmer)(tool_name, &input) {
+                if self.confirmer.confirm(tool_name, &input).await {
                     tool.execute(input).await
                 } else {
                     Ok(ToolResult {
@@ -85,11 +161,6 @@ impl Sandbox {
         sb.register(Box::new(GrepTool::new(working_dir)));
         sb
     }
-}
-
-/// 默认确认器：总是放行（供测试与默认场景）。
-pub fn auto_confirm() -> Confirmer {
-    Box::new(|_name: &str, _input: &Value| true)
 }
 
 /// Linux 下使用 landlock 在**当前线程/进程**建立文件系统 + 网络沙箱。
@@ -221,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_false_blocks() {
         let dir = tempdir().unwrap();
-        let confirmer: Confirmer = Box::new(|_, _| false);
+        let confirmer = confirmer_from_fn(|_, _| false);
         let mut sb = Sandbox::new(dir.path().to_path_buf(), confirmer);
         sb.register(Box::new(FileWriteTool::new(dir.path().to_path_buf())));
         let r = sb
@@ -260,7 +331,7 @@ mod tests {
     async fn allow_tool_skips_confirmer_even_if_false() {
         // ShellTool 对 `ls` 为 Allow，即便 confirmer 总返回 false 也应执行。
         let dir = tempdir().unwrap();
-        let confirmer: Confirmer = Box::new(|_, _| false);
+        let confirmer = confirmer_from_fn(|_, _| false);
         let mut sb = Sandbox::new(dir.path().to_path_buf(), confirmer);
         sb.register(Box::new(ShellTool::new(dir.path().to_path_buf())));
         let r = sb
@@ -269,5 +340,32 @@ mod tests {
             .unwrap();
         assert!(r.error.is_none(), "{:?}", r.error);
         assert!(r.output.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn channel_confirmer_true_allows() {
+        let dir = tempdir().unwrap();
+        let (confirmer, tx) = channel_confirmer(2);
+        let mut sb = Sandbox::new(dir.path().to_path_buf(), confirmer);
+        sb.register(Box::new(FileWriteTool::new(dir.path().to_path_buf())));
+        let path = dir.path().join("y.txt");
+        let task = sb.execute("write", json!({"path": "y.txt", "content": "z"}));
+        tx.send(true).await.unwrap();
+        let r = task.await.unwrap();
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "z");
+    }
+
+    #[tokio::test]
+    async fn channel_confirmer_false_blocks() {
+        let dir = tempdir().unwrap();
+        let (confirmer, tx) = channel_confirmer(2);
+        let mut sb = Sandbox::new(dir.path().to_path_buf(), confirmer);
+        sb.register(Box::new(FileWriteTool::new(dir.path().to_path_buf())));
+        let task = sb.execute("write", json!({"path": "y.txt", "content": "z"}));
+        tx.send(false).await.unwrap();
+        let r = task.await.unwrap();
+        assert!(r.error.unwrap().contains("blocked"));
+        assert!(!dir.path().join("y.txt").exists());
     }
 }

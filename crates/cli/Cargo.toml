@@ -15,6 +15,7 @@ forgeclaw-core = { workspace = true }
 forgeclaw-llm = { workspace = true }
 forgeclaw-tools = { workspace = true }
 forgeclaw-server = { workspace = true }
+async-trait = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

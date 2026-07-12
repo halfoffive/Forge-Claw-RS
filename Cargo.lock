@@ -605,6 +605,7 @@ name = "forgeclaw"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "forgeclaw-core",
  "forgeclaw-llm",
@@ -664,6 +665,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-http 0.7.0",
  "tower_governor",
