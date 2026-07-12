@@ -61,6 +61,25 @@
 - [x] Task 13 验证：`cargo check --workspace` 通过（landlock 不影响 Windows/macOS 编译）
 - [x] Task 13 验证：Linux 交叉编译 `cargo check -p forgeclaw-tools --target x86_64-unknown-linux-gnu` 通过
 
+## 修复阶段验证（阶段 2 P1）
+
+- [x] Task 14 验证：`cargo test -p forgeclaw` 通过（AsyncConfirmer + CLI confirm 复用沙箱）
+- [x] Task 15 验证：`cargo test -p forgeclaw-llm` 通过（TryFrom + 未知 role 不回落）
+- [x] Task 16 验证：`cargo test -p forgeclaw-core` 与 `cargo test -p forgeclaw-server` 通过（InvalidName）
+- [x] Task 17 验证：`bun run build` 与 `bun run typecheck` 通过（前端设计系统）
+- [x] Task 18+19 验证：`cargo test -p forgeclaw-server` 通过（WS 协议 + call_id）
+- [x] Task 20 验证：`release.yml` 结构正确（单汇总 job 上传产物）
+
+## 修复阶段验证（阶段 3 P1）
+
+- [x] Task 21/22/23/29 验证：`cargo test -p forgeclaw-server` 通过（并发、user_id、超时 abort、Error 脱敏）
+- [x] Task 24 验证：`cargo test -p forgeclaw-server` 通过（history 读锁快照不阻塞 LLM）
+- [x] Task 25 验证：`cargo test -p forgeclaw-core` 与 `cargo test -p forgeclaw-server` 通过（PromptEngine 并发）
+- [x] Task 26 验证：`cargo test -p forgeclaw-server` 通过（server 模式不自动放行 Confirm）
+- [x] Task 27/28 验证：`cargo test -p forgeclaw-server` 通过（常量时间 token + Debug 脱敏）
+- [x] Task 30 验证：`cargo test -p forgeclaw` 通过（Windows ACL）
+- [x] Task 31 验证：`cargo test -p forgeclaw-server` 通过（orchestrator 测试重写）
+
 ## 边界约束
 
 - [x] 审计阶段未修改任何源码（仅新增 `FRESH_AUDIT_REPORT.md` 与 spec 文档）
