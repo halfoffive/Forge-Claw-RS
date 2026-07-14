@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -58,6 +58,22 @@ impl PromptEngine {
         Ok(self.profiles_root.join(format!("{profile_name}.toml")))
     }
 
+    /// 同步加载 profile 并返回 model_hint（若存在且非空则覆盖 model）。
+    pub fn resolve_model(&self, profile_name: &str, model: &str) -> Result<String> {
+        let path = self.profile_path(profile_name)?;
+        let profile = crate::prompt::profile::load_profile(&path).map_err(|e| match e {
+            CoreError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                CoreError::ProfileNotFound(profile_name.to_string())
+            }
+            other => other,
+        })?;
+        if !profile.model_hint.is_empty() {
+            Ok(profile.model_hint)
+        } else {
+            Ok(model.to_string())
+        }
+    }
+
     /// section 路径相对提示词根（profiles_root 的父目录）解析。
     fn sections_base(&self) -> PathBuf {
         match self.profiles_root.parent() {
@@ -83,7 +99,7 @@ impl PromptEngine {
             if !is_safe_name(&name) {
                 return Err(CoreError::InvalidName(name));
             }
-            let abs = base.join(&rel);
+            let abs = safe_join(&base, &rel)?;
             let text = match fs::read_to_string(&abs).await {
                 Ok(t) => t,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -112,7 +128,7 @@ impl PromptEngine {
             if !is_safe_name(&name) {
                 return Err(CoreError::InvalidName(name));
             }
-            let abs = base.join(&rel);
+            let abs = safe_join(&base, &rel)?;
             let section = load_section_file(&abs).map_err(|e| match e {
                 CoreError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
                     CoreError::SectionNotFound(name.clone(), rel)
@@ -165,8 +181,11 @@ impl PromptEngine {
             output.push_str(&section.body);
         }
 
-        for (k, v) in vars {
-            output = output.replace(&format!("{{{{{k}}}}}"), v);
+        let mut keys: Vec<&str> = vars.keys().copied().collect();
+        keys.sort_unstable();
+        for k in keys {
+            let v = sanitize_var_value(&vars[k]);
+            output = output.replace(&format!("{{{{{k}}}}}"), &v);
         }
 
         // 4. 短写锁插入缓存（带二次检查，避免并发重复编译）。
@@ -190,6 +209,40 @@ fn is_safe_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 将 `rel` 安全地 join 到 `base`，拒绝路径遍历（绝对路径或 `..` 跳出 base）。
+fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf> {
+    if rel.is_absolute() {
+        return Err(CoreError::PathTraversal(rel.to_path_buf()));
+    }
+    let base_norm = normalize_path(base);
+    let joined = base.join(rel);
+    let normalized = normalize_path(&joined);
+    if !normalized.starts_with(&base_norm) {
+        return Err(CoreError::PathTraversal(rel.to_path_buf()));
+    }
+    Ok(normalized)
+}
+
+/// 词法规范化路径：解析 `.` 和 `..`，不访问文件系统。
+fn normalize_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// 清理变量值中的 `{{` 和 `}}` 字符，防止注入嵌套变量占位符。
+fn sanitize_var_value(value: &str) -> String {
+    value.replace("{{", "").replace("}}", "")
 }
 
 /// 按 `order` 升序排序，相同 order 时以 `id` 作 tiebreaker；过滤 `enabled=false`。
@@ -401,6 +454,74 @@ mod tests {
             matches!(err, CoreError::InvalidName(ref name) if name == "../etc"),
             "expected InvalidName(../etc), got {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_path_traversal() {
+        let base = PathBuf::from("/tmp/prompts");
+        for bad in [
+            "../../etc/passwd",
+            "../outside",
+            "sections/../../../etc/shadow",
+        ] {
+            let rel = PathBuf::from(bad);
+            let result = safe_join(&base, &rel);
+            assert!(
+                matches!(result, Err(CoreError::PathTraversal(_))),
+                "expected PathTraversal error for rel={:?}, got {:?}",
+                bad,
+                result
+            );
+        }
+        let abs_rel = PathBuf::from("/etc/passwd");
+        assert!(
+            matches!(safe_join(&base, &abs_rel), Err(CoreError::PathTraversal(_))),
+            "absolute path should be rejected"
+        );
+        for good in ["sections/identity.md", "safety.md", "./sections/tools.md"] {
+            let rel = PathBuf::from(good);
+            let result = safe_join(&base, &rel);
+            assert!(
+                result.is_ok(),
+                "safe_join should succeed for rel={:?}, got {:?}",
+                good,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn safe_join_normalizes_cwd() {
+        let base = PathBuf::from("/tmp/prompts");
+        let rel = PathBuf::from("sections/./style.md");
+        let result = safe_join(&base, &rel).expect("should succeed");
+        assert_eq!(result, PathBuf::from("/tmp/prompts/sections/style.md"));
+    }
+
+    #[test]
+    fn sanitize_var_value_strips_template_braces() {
+        assert_eq!(sanitize_var_value("/workspace"), "/workspace");
+        assert_eq!(
+            sanitize_var_value("/workspace/{{evil}}/path"),
+            "/workspace/evil/path"
+        );
+        assert_eq!(sanitize_var_value("{{injected}}"), "injected");
+        assert_eq!(sanitize_var_value("a{{b}}c{{d}}e"), "abcde");
+        assert_eq!(sanitize_var_value("normal value"), "normal value");
+    }
+
+    #[tokio::test]
+    async fn variable_injection_is_sanitized() {
+        let engine = PromptEngine::new(profiles_root());
+        let mut v: HashMap<&str, String> = HashMap::new();
+        v.insert("tools", "ShellTool".to_string());
+        v.insert("model", "deepseek-chat".to_string());
+        v.insert("cwd", "/workspace/{{tools}}".to_string());
+        let out = engine.compile("default", &v).await.expect("compile failed");
+        assert!(
+            !out.contains("{{tools}}"),
+            "injected {{tools}} from cwd should have been sanitized\n{out}"
         );
     }
 }

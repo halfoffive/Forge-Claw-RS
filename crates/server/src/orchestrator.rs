@@ -271,11 +271,12 @@ impl Orchestrator {
                 return Ok(event);
             }
 
+            temp.truncate_to_limit();
             let req = ChatRequest::from_history(
                 &temp,
                 &self.model,
                 Some(0.0),
-                None,
+                Some(4096),
                 Some(tool_specs.to_vec()),
             );
             let mut stream = self.llm.chat(req).await?;

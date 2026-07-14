@@ -43,6 +43,16 @@ async function scrollToBottom(): Promise<void> {
   if (scrollEl.value) scrollEl.value.scrollTop = scrollEl.value.scrollHeight
 }
 
+let pendingText = ''
+
+function rollback(): void {
+  if (!pendingText) return
+  session.popMessage()
+  session.popMessage()
+  input.value = pendingText
+  pendingText = ''
+}
+
 async function send(): Promise<void> {
   const text = input.value.trim()
   if (!text || sending.value) return
@@ -51,6 +61,7 @@ async function send(): Promise<void> {
     return
   }
 
+  pendingText = text
   input.value = ''
   session.pushMessage({ User: text })
   await scrollToBottom()
@@ -59,13 +70,10 @@ async function send(): Promise<void> {
   status.value = 'connecting'
   errorMsg.value = ''
 
-  // 占位 assistant 消息：delta 持续追加 text。
   const assistantIdx = session.currentMessages.length
   session.pushMessage({ Assistant: { text: '', tool_calls: [] } })
   await scrollToBottom()
 
-  // F-12: 新会话由前端预生成 session_id，后端据此创建并复用同一会话，
-  // 避免后端 WS 流不回传 session_id 导致每条消息开新会话。
   if (!session.currentId) {
     session.setCurrentId(crypto.randomUUID())
   }
@@ -81,8 +89,7 @@ async function send(): Promise<void> {
     const url = buildWsUrl(ticket)
     ws = new WebSocket(url)
   } catch (e) {
-    // 清理已追加的用户消息与占位 assistant 消息，避免状态污染。
-    session.popMessage()
+    rollback()
     status.value = 'error'
     errorMsg.value = e instanceof ApiError ? e.message : '获取 WS ticket 失败'
     sending.value = false
@@ -97,11 +104,13 @@ async function send(): Promise<void> {
   ws.onerror = () => {
     status.value = 'error'
     errorMsg.value = 'WebSocket 连接错误'
+    rollback()
+    sending.value = false
   }
   ws.onclose = () => {
-    // F-08: 区分正常/异常关闭。streaming 中被服务端断开视为异常。
-    if (status.value === 'streaming') {
+    if (status.value === 'streaming' || status.value === 'connecting') {
       errorMsg.value = '连接中断，回复可能不完整'
+      rollback()
     }
     if (status.value !== 'error') {
       status.value = 'idle'
@@ -155,10 +164,8 @@ function onFrame(raw: string, assistantIdx: number): void {
       const m = session.currentMessages[assistantIdx]
       if (m && 'Assistant' in m) {
         m.Assistant.text = event.text || m.Assistant.text
-        // F-02: complete.tool_calls 是 ToolCallRecord[]（含 result），
-        // 与 Assistant.tool_calls(ToolCall[]) 形状不同，且工具调用已由
-        // 上方 Tool 消息承载，这里不再覆盖。
       }
+      pendingText = ''
       status.value = 'idle'
       sending.value = false
       cleanupWs()
@@ -167,6 +174,7 @@ function onFrame(raw: string, assistantIdx: number): void {
     case 'error': {
       errorMsg.value = event.message
       status.value = 'error'
+      rollback()
       sending.value = false
       cleanupWs()
       break
@@ -191,11 +199,10 @@ onUnmounted(cleanupWs)
 function startNew(): void {
   cleanupWs()
   session.newSession()
-  // F-12: 预生成 session_id，发送时回传后端，前端已知 id。
   session.setCurrentId(crypto.randomUUID())
   status.value = 'idle'
   errorMsg.value = ''
-  // F-09: streaming 中点击新会话需重置 sending，避免按钮卡死。
+  pendingText = ''
   sending.value = false
 }
 

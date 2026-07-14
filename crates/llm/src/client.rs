@@ -142,6 +142,7 @@ where
         buf: Vec<u8>,
         pending: std::collections::VecDeque<Event>,
         done: bool,
+        received_done: bool,
     }
 
     let init = State {
@@ -149,14 +150,22 @@ where
         buf: Vec::new(),
         pending: std::collections::VecDeque::new(),
         done: false,
+        received_done: false,
     };
 
     futures::stream::unfold(init, |mut st| async move {
         loop {
             if let Some(ev) = st.pending.pop_front() {
+                if matches!(ev, Event::Done) {
+                    st.received_done = true;
+                }
                 return Some((ev, st));
             }
             if st.done {
+                if !st.received_done {
+                    st.received_done = true;
+                    return Some((Event::Error("stream ended without [DONE]".into()), st));
+                }
                 return None;
             }
             match st.inner.next().await {
@@ -166,6 +175,9 @@ where
                         let evs = parse_sse_events(&String::from_utf8_lossy(&st.buf));
                         st.buf.clear();
                         for ev in evs {
+                            if matches!(ev, Event::Done) {
+                                st.received_done = true;
+                            }
                             st.pending.push_back(ev);
                         }
                     }
@@ -183,6 +195,9 @@ where
                         let block: Vec<u8> = st.buf.drain(..idx).collect();
                         st.buf.drain(..sep_len);
                         for ev in parse_sse_events(&String::from_utf8_lossy(&block)) {
+                            if matches!(ev, Event::Done) {
+                                st.received_done = true;
+                            }
                             st.pending.push_back(ev);
                         }
                     }
@@ -216,12 +231,15 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    /// 构造客户端：rustls + 60s 超时。`base_url` 末尾 `/` 会被裁掉。
+    /// 构造客户端：rustls + 连接超时10s + 整体请求超时600s。`base_url` 末尾 `/` 会被裁掉。
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> anyhow::Result<Self> {
-        let timeout = Duration::from_secs(60);
+        let connect_timeout = Duration::from_secs(10);
+        let request_timeout = Duration::from_secs(600);
         let http = reqwest::Client::builder()
             .use_rustls_tls()
-            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .timeout(request_timeout)
             .build()?;
         Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -230,7 +248,7 @@ impl OpenAiClient {
         })
     }
 
-    /// 带重试的 POST。仅对**连接错误**与 **5xx** 重试（最多 2 次重试，指数退避）；
+    /// 带重试的 POST。仅对**连接错误**与 **5xx** 重试（最多 3 次重试，共 4 次尝试，指数退避：1s,2s,4s）；
     /// 4xx 立即返回（由调用方处理状态码）。
     async fn send_with_retry(
         &self,
@@ -238,9 +256,9 @@ impl OpenAiClient {
         body: &serde_json::Value,
     ) -> anyhow::Result<reqwest::Response> {
         let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 0..3u32 {
+        for attempt in 0..4u32 {
             if attempt > 0 {
-                let backoff = Duration::from_millis(500u64 * 2u64.pow(attempt - 1));
+                let backoff = Duration::from_millis(500u64 * 2u64.pow(attempt));
                 tokio::time::sleep(backoff).await;
             }
             match self
@@ -281,7 +299,10 @@ impl LlmClient for OpenAiClient {
         let response = self.send_with_retry(&url, &body).await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read error body>".to_string());
             // 截断到前 512 字节，避免超大错误响应撑爆日志/上下文。
             let truncated: &str = if text.len() > 512 {
                 let mut end = 512;
@@ -470,5 +491,24 @@ mod tests {
             got.push(ev);
         }
         assert_eq!(got, vec![Event::Done]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_stream_sends_error_on_unexpected_end_without_done() {
+        let bytes: Vec<Result<Vec<u8>, reqwest::Error>> = vec![Ok(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n".to_vec(),
+        )];
+        let src = futures::stream::iter(bytes);
+        let mut s = Box::pin(parse_sse_stream(src));
+        let mut got = Vec::new();
+        while let Some(ev) = s.next().await {
+            got.push(ev);
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Event::Delta("Hello".into()));
+        match &got[1] {
+            Event::Error(msg) => assert_eq!(msg, "stream ended without [DONE]"),
+            other => panic!("expected Error, got {:?}", other),
+        }
     }
 }

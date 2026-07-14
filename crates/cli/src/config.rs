@@ -77,7 +77,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 加载配置：文件 > 默认值，再叠加环境变量 api_key 覆盖。
+    /// 加载配置：文件 > 默认值，再叠加环境变量 api_key 覆盖，并规范化路径为绝对路径。
     pub fn load() -> anyhow::Result<Config> {
         let mut cfg = load_file_or_defaults();
         let env_key = std::env::var("DEEPSEEK_API_KEY")
@@ -86,7 +86,20 @@ impl Config {
         if let Some(k) = env_key {
             cfg.api_key = k;
         }
+        cfg.prompts_root = normalize_path(&cfg.prompts_root)?;
+        cfg.working_dir = normalize_path(&cfg.working_dir)?;
         Ok(cfg)
+    }
+
+    /// 早期校验：检查 api_key 是否已配置。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.api_key.is_empty() {
+            anyhow::bail!(
+                "api_key 未配置：请设置环境变量 DEEPSEEK_API_KEY/FORGECLAW_API_KEY，\
+                 或运行 `forgeclaw-cli config init` 后填写 ~/.forgeclaw/config.toml"
+            );
+        }
+        Ok(())
     }
 
     /// `config init` 用的默认模板（带一个示例本地用户，随机 token）。
@@ -163,6 +176,14 @@ fn mask_key(key: &str) -> String {
         .rev()
         .collect();
     format!("{head}...{tail}")
+}
+
+fn normalize_path(p: &std::path::Path) -> anyhow::Result<PathBuf> {
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(p))
+    }
 }
 
 /// Windows：设置受保护 DACL，仅允许当前用户读写。

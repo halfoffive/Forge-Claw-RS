@@ -25,6 +25,16 @@ async function load(): Promise<void> {
     loading.value = false
   }
 }
+
+function formatSchema(p: unknown): string {
+  if (p == null) return ''
+  if (typeof p === 'string') return p
+  try {
+    return JSON.stringify(p, null, 2)
+  } catch {
+    return String(p)
+  }
+}
 </script>
 
 <template>
@@ -44,7 +54,7 @@ async function load(): Promise<void> {
         <p class="desc">{{ t.description }}</p>
         <details v-if="t.parameters != null">
           <summary>参数 schema</summary>
-          <pre class="schema">{{ t.parameters }}</pre>
+          <pre class="schema">{{ formatSchema(t.parameters) }}</pre>
         </details>
       </li>
     </ul>
