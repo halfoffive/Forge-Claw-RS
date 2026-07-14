@@ -157,13 +157,73 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'path' field"))?;
         let path = self.resolve(path_str);
-        if !is_within(&path, &self.working_dir) {
-            return Ok(blocked("path outside working directory"));
-        }
         const MAX_READ_BYTES: usize = 1024 * 1024;
 
         let start = std::time::Instant::now();
-        match tokio::fs::read(&path).await {
+
+        #[cfg(unix)]
+        let read_result: std::io::Result<Vec<u8>> = {
+            use std::os::unix::io::AsRawFd;
+            use tokio::fs::OpenOptions;
+
+            let canon_working_dir = match self.working_dir.canonicalize() {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        output: String::new(),
+                        error: Some(format!("cannot canonicalize working dir: {}", e)),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    })
+                }
+            };
+
+            let file = match OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        output: String::new(),
+                        error: Some(format!("read failed: {}", e)),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    })
+                }
+            };
+
+            let std_file = file.into_std().await;
+            let fd = std_file.as_raw_fd();
+            let fd_path = format!("/proc/self/fd/{}", fd);
+            let real_path = match std::fs::canonicalize(&fd_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(blocked("path outside working directory (cannot resolve fd)"));
+                }
+            };
+
+            if !real_path.starts_with(&canon_working_dir) {
+                return Ok(blocked("path outside working directory"));
+            }
+
+            use tokio::io::AsyncReadExt;
+            let tokio_file = tokio::fs::File::from_std(std_file);
+            let mut bytes = Vec::new();
+            match tokio_file.take(MAX_READ_BYTES as u64 + 1).read_to_end(&mut bytes).await {
+                Ok(_) => Ok(bytes),
+                Err(e) => Err(e),
+            }
+        };
+
+        #[cfg(not(unix))]
+        let read_result: std::io::Result<Vec<u8>> = {
+            if !is_within(&path, &self.working_dir) {
+                return Ok(blocked("path outside working directory"));
+            }
+            tokio::fs::read(&path).await
+        };
+
+        match read_result {
             Ok(bytes) => {
                 let truncated = bytes.len() > MAX_READ_BYTES;
                 let text =
