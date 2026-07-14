@@ -497,7 +497,7 @@ mod tests {
             assert!(
                 h.messages().iter().any(|m| {
                     m.role == Role::Assistant
-                        && m.tool_calls.as_ref().map_or(false, |tcs| {
+                        && m.tool_calls.as_ref().is_some_and(|tcs| {
                             tcs.iter().any(|tc| tc.id == *tc_id)
                         })
                 }),
