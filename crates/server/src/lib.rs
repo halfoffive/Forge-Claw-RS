@@ -196,6 +196,8 @@ pub async fn run(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
 pub fn build_orchestrator(config: OrchestratorConfig) -> anyhow::Result<Arc<Orchestrator>> {
     let llm: Arc<dyn forgeclaw_llm::LlmClient> =
         Arc::new(OpenAiClient::new(config.base_url, config.api_key)?);
+    let engine = forgeclaw_core::prompt::PromptEngine::new(config.prompts_root.clone());
+    let model = engine.resolve_model(&config.profile, &config.model)?;
     let (sandbox, tool_specs) = default_sandbox_with_specs(config.working_dir.clone());
     let orch = Orchestrator::new(
         llm,
@@ -203,7 +205,7 @@ pub fn build_orchestrator(config: OrchestratorConfig) -> anyhow::Result<Arc<Orch
         tool_specs,
         config.prompts_root,
         config.profile,
-        config.model,
+        model,
         config.working_dir,
     );
     Ok(Arc::new(orch))

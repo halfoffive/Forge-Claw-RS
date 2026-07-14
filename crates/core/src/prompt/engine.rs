@@ -58,6 +58,22 @@ impl PromptEngine {
         Ok(self.profiles_root.join(format!("{profile_name}.toml")))
     }
 
+    /// 同步加载 profile 并返回 model_hint（若存在且非空则覆盖 model）。
+    pub fn resolve_model(&self, profile_name: &str, model: &str) -> Result<String> {
+        let path = self.profile_path(profile_name)?;
+        let profile = crate::prompt::profile::load_profile(&path).map_err(|e| match e {
+            CoreError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                CoreError::ProfileNotFound(profile_name.to_string())
+            }
+            other => other,
+        })?;
+        if !profile.model_hint.is_empty() {
+            Ok(profile.model_hint)
+        } else {
+            Ok(model.to_string())
+        }
+    }
+
     /// section 路径相对提示词根（profiles_root 的父目录）解析。
     fn sections_base(&self) -> PathBuf {
         match self.profiles_root.parent() {

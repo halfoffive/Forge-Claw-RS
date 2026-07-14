@@ -37,12 +37,7 @@ const RESET: &str = "\x1b[0m";
 /// 构建 orchestrator。`auto_apply=true` 用 server 工厂（auto_confirm）；
 /// `false` 在 cli 内自建带 stdin 确认器的沙箱。
 fn build_orchestrator(cfg: &Config, auto_apply: bool) -> anyhow::Result<Arc<Orchestrator>> {
-    if cfg.api_key.is_empty() {
-        bail!(
-            "api_key 未配置：请设置环境变量 DEEPSEEK_API_KEY/FORGECLAW_API_KEY，\
-             或运行 `forgeclaw-cli config init` 后填写 ~/.forgeclaw/config.toml"
-        );
-    }
+    cfg.validate()?;
     if auto_apply {
         let orch = build_server_orchestrator(OrchestratorConfig {
             base_url: cfg.base_url.clone(),
@@ -92,6 +87,8 @@ fn build_orchestrator_confirm(cfg: &Config) -> anyhow::Result<Arc<Orchestrator>>
         cfg.base_url.clone(),
         cfg.api_key.clone(),
     )?);
+    let engine = PromptEngine::new(cfg.prompts_root.clone());
+    let model = engine.resolve_model(&cfg.profile, &cfg.model)?;
     let working_dir = cfg.working_dir.clone();
     let (mut sandbox, specs) = default_sandbox_with_specs(working_dir.clone());
     sandbox.with_confirmer(Arc::new(StdinConfirmer));
@@ -101,7 +98,7 @@ fn build_orchestrator_confirm(cfg: &Config) -> anyhow::Result<Arc<Orchestrator>>
         specs,
         cfg.prompts_root.clone(),
         cfg.profile.clone(),
-        cfg.model.clone(),
+        model,
         working_dir,
     )))
 }
