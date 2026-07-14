@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 pub use client::{parse_sse_events, parse_sse_stream, LlmClient, OpenAiClient};
 
+/// 默认上下文窗口限制（字节数）：100,000 字节 ≈ 25,000 tokens（中英混合平均 4 字节/token）。
+/// 安全余量，防止请求过大触发 API 400 错误。
+pub const DEFAULT_CONTEXT_LIMIT: usize = 100_000;
+
 // ============ DTO ============
 
 /// OpenAI 风格 `tool_calls` 数组中的单条工具调用。
@@ -245,6 +249,57 @@ impl History {
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
     }
+
+    /// 估算消息总 token 数：按字节数/4 估算（中英混合平均）。
+    /// content 字节数 + tool_calls 中 name 和 arguments 字节数都计入。
+    pub fn estimate_tokens(&self) -> usize {
+        self.estimate_bytes() / 4
+    }
+
+    /// 估算消息总字节数。
+    pub fn estimate_bytes(&self) -> usize {
+        self.messages.iter().map(estimate_message_bytes).sum()
+    }
+
+    /// 截断历史到 DEFAULT_CONTEXT_LIMIT 以内：
+    /// - 保留 system prompt（如果 messages[0] 是 system）
+    /// - 从前面移除最早的完整对话轮次（user -> assistant -> tool*）
+    /// - 保持 tool 消息与对应 assistant tool_calls 配对完整
+    /// - 保持剩余消息顺序不变
+    /// - 总是保留最后一轮对话（当前轮次）
+    pub fn truncate_to_limit(&mut self) {
+        while self.estimate_bytes() > DEFAULT_CONTEXT_LIMIT {
+            let has_system = !self.messages.is_empty() && self.messages[0].role == Role::System;
+            let start = if has_system { 1 } else { 0 };
+
+            if self.messages.len() <= start + 1 {
+                return;
+            }
+
+            let mut end = start + 1;
+            while end < self.messages.len() && self.messages[end].role != Role::User {
+                end += 1;
+            }
+
+            if end == self.messages.len() {
+                return;
+            }
+
+            self.messages.drain(start..end);
+        }
+    }
+}
+
+fn estimate_message_bytes(msg: &ChatMessage) -> usize {
+    let mut bytes = msg.content.len();
+    if let Some(tcs) = &msg.tool_calls {
+        for tc in tcs {
+            bytes += tc.id.len();
+            bytes += tc.function.name.len();
+            bytes += tc.function.arguments.len();
+        }
+    }
+    bytes
 }
 
 #[cfg(test)]
@@ -353,5 +408,147 @@ mod tests {
         let result = Role::try_from("developer");
         assert!(result.is_err());
         assert_ne!(result.ok(), Some(Role::User));
+    }
+
+    #[test]
+    fn estimate_tokens_counts_content_and_tool_calls() {
+        let mut h = History::new();
+        h.append(ChatMessage::user("hello"));
+        assert_eq!(h.estimate_tokens(), 5 / 4);
+
+        let mut h2 = History::new();
+        let mut assistant_msg = ChatMessage::assistant("");
+        assistant_msg.tool_calls = Some(vec![ToolCallDto {
+            id: "call_1".into(),
+            function: FunctionCallDto {
+                name: "test_tool".into(),
+                arguments: "{\"a\":1}".into(),
+            },
+        }]);
+        h2.append(assistant_msg);
+        let expected_bytes = "call_1".len() + "test_tool".len() + "{\"a\":1}".len();
+        assert_eq!(h2.estimate_tokens(), expected_bytes / 4);
+    }
+
+    #[test]
+    fn truncate_no_op_when_under_limit() {
+        let mut h = History::with_system("sys");
+        h.append(ChatMessage::user("hello"));
+        h.append(ChatMessage::assistant("hi"));
+        let before = h.messages().to_vec();
+        h.truncate_to_limit();
+        assert_eq!(h.messages(), &before[..]);
+    }
+
+    #[test]
+    fn truncate_removes_oldest_turns_keeps_system_and_latest() {
+        let mut h = History::with_system("sys");
+        let long_content = "x".repeat(DEFAULT_CONTEXT_LIMIT / 3);
+        h.append(ChatMessage::user(long_content.clone()));
+        h.append(ChatMessage::assistant(long_content.clone()));
+        h.append(ChatMessage::user(long_content.clone()));
+        h.append(ChatMessage::assistant("final"));
+
+        assert!(h.estimate_bytes() > DEFAULT_CONTEXT_LIMIT);
+        h.truncate_to_limit();
+        assert!(h.estimate_bytes() <= DEFAULT_CONTEXT_LIMIT);
+
+        assert_eq!(h.messages()[0].role, Role::System);
+        assert_eq!(h.messages().last().unwrap().content, "final");
+        assert!(h.messages().iter().any(|m| m.role == Role::User && m.content == long_content));
+    }
+
+    #[test]
+    fn truncate_keeps_tool_calls_paired() {
+        let mut h = History::with_system("sys");
+        let long_content = "x".repeat(DEFAULT_CONTEXT_LIMIT / 2);
+
+        h.append(ChatMessage::user(long_content.clone()));
+        let mut a1 = ChatMessage::assistant("");
+        a1.tool_calls = Some(vec![ToolCallDto {
+            id: "call_old".into(),
+            function: FunctionCallDto {
+                name: "tool".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        h.append(a1);
+        h.append(ChatMessage::tool("old result", "call_old"));
+
+        h.append(ChatMessage::user(long_content.clone()));
+        let mut a2 = ChatMessage::assistant("");
+        a2.tool_calls = Some(vec![ToolCallDto {
+            id: "call_new".into(),
+            function: FunctionCallDto {
+                name: "tool".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        h.append(a2);
+        h.append(ChatMessage::tool("new result", "call_new"));
+
+        assert!(h.estimate_bytes() > DEFAULT_CONTEXT_LIMIT);
+        h.truncate_to_limit();
+
+        assert_eq!(h.messages()[0].role, Role::System);
+        let tool_msgs: Vec<_> = h.messages().iter().filter(|m| m.role == Role::Tool).collect();
+        for tm in tool_msgs {
+            let tc_id = tm.tool_call_id.as_ref().unwrap();
+            assert!(
+                h.messages().iter().any(|m| {
+                    m.role == Role::Assistant
+                        && m.tool_calls.as_ref().map_or(false, |tcs| {
+                            tcs.iter().any(|tc| tc.id == *tc_id)
+                        })
+                }),
+                "tool message {} has no matching assistant tool_call",
+                tc_id
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_preserves_message_order() {
+        let mut h = History::with_system("sys");
+        let long_content = "x".repeat(DEFAULT_CONTEXT_LIMIT / 4);
+        for i in 0..5 {
+            h.append(ChatMessage::user(format!("u{}", i)));
+            h.append(ChatMessage::assistant(format!("a{}", i)));
+        }
+        h.append(ChatMessage::user(long_content));
+        h.append(ChatMessage::assistant("final"));
+
+        h.truncate_to_limit();
+
+        let msgs = h.messages();
+        let mut i = if !msgs.is_empty() && msgs[0].role == Role::System { 1 } else { 0 };
+        while i < msgs.len() {
+            assert_eq!(msgs[i].role, Role::User, "expected user at position {}", i);
+            i += 1;
+            while i < msgs.len() && msgs[i].role != Role::User {
+                assert!(
+                    msgs[i].role == Role::Assistant || msgs[i].role == Role::Tool,
+                    "expected assistant/tool after user at position {}, got {:?}",
+                    i,
+                    msgs[i].role
+                );
+                i += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_works_without_system_prompt() {
+        let mut h = History::new();
+        let long_content = "x".repeat(DEFAULT_CONTEXT_LIMIT / 3);
+        h.append(ChatMessage::user(long_content.clone()));
+        h.append(ChatMessage::assistant(long_content.clone()));
+        h.append(ChatMessage::user("final"));
+        h.append(ChatMessage::assistant("ok"));
+
+        h.truncate_to_limit();
+        assert!(h.estimate_bytes() <= DEFAULT_CONTEXT_LIMIT);
+        assert!(h.messages().iter().any(|m| m.role == Role::User));
+        assert_eq!(h.messages().last().unwrap().content, "ok");
     }
 }
