@@ -30,6 +30,10 @@ pub enum CoreError {
     /// 非法 profile / section 名（含路径遍历字符或空）。
     #[error("invalid name: {0}")]
     InvalidName(String),
+
+    /// section 路径尝试跳出提示词根目录（路径遍历攻击）。
+    #[error("path traversal detected: {0}")]
+    PathTraversal(PathBuf),
 }
 
 /// core crate 统一 Result 别名。
