@@ -70,12 +70,13 @@ async function doCompile(): Promise<void> {
     <p v-if="error" class="error">{{ error }}</p>
 
     <div class="card">
-      <h3 class="card-title">编辑器</h3>
+      <h3 class="card-title">章节预览（只读）</h3>
       <textarea
         v-model="body"
         class="editor"
-        placeholder="提示词内容..."
+        placeholder='点击"加载章节"按钮加载profile的章节内容'
         rows="12"
+        readonly
       />
     </div>
 
@@ -162,6 +163,11 @@ async function doCompile(): Promise<void> {
   background: var(--color-bg);
   color: var(--color-text);
   resize: vertical;
+}
+
+.editor[readonly] {
+  opacity: 0.8;
+  cursor: default;
 }
 
 .compiled {
