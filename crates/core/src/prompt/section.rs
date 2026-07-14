@@ -224,21 +224,30 @@ mod tests {
     fn quoted_title_strips_only_one_pair_of_quotes() {
         let text = "---\nid: x\ntitle: \"\"\"hello\"\"\"\nlevel: allow\norder: 1\n---\nb\n";
         let s = parse_section(text).unwrap();
-        assert_eq!(s.title, "\"\"hello\"\"", "only the outermost pair of quotes should be stripped");
+        assert_eq!(
+            s.title, "\"\"hello\"\"",
+            "only the outermost pair of quotes should be stripped"
+        );
     }
 
     #[test]
     fn single_leading_quote_not_stripped() {
         let text = "---\nid: x\ntitle: \"hello\nlevel: allow\norder: 1\n---\nb\n";
         let s = parse_section(text).unwrap();
-        assert_eq!(s.title, "\"hello", "single leading quote should not be stripped");
+        assert_eq!(
+            s.title, "\"hello",
+            "single leading quote should not be stripped"
+        );
     }
 
     #[test]
     fn single_trailing_quote_not_stripped() {
         let text = "---\nid: x\ntitle: hello\"\nlevel: allow\norder: 1\n---\nb\n";
         let s = parse_section(text).unwrap();
-        assert_eq!(s.title, "hello\"", "single trailing quote should not be stripped");
+        assert_eq!(
+            s.title, "hello\"",
+            "single trailing quote should not be stripped"
+        );
     }
 
     #[test]
@@ -266,9 +275,14 @@ mod tests {
             ("off", false),
             ("OFF", false),
         ] {
-            let text = format!("---\nid: x\ntitle: t\nlevel: allow\nenabled: {val}\norder: 1\n---\nb\n");
-            let s = parse_section(&text).unwrap_or_else(|e| panic!("failed to parse enabled={val}: {e}"));
-            assert_eq!(s.enabled, expected, "enabled={val} should parse to {expected}");
+            let text =
+                format!("---\nid: x\ntitle: t\nlevel: allow\nenabled: {val}\norder: 1\n---\nb\n");
+            let s = parse_section(&text)
+                .unwrap_or_else(|e| panic!("failed to parse enabled={val}: {e}"));
+            assert_eq!(
+                s.enabled, expected,
+                "enabled={val} should parse to {expected}"
+            );
         }
     }
 
@@ -277,7 +291,10 @@ mod tests {
         for bad in ["-1", "10000", "99999"] {
             let text = format!("---\nid: x\ntitle: t\nlevel: allow\norder: {bad}\n---\nb\n");
             let err = parse_section(&text).unwrap_err();
-            assert!(matches!(err, CoreError::Parse(_)), "order={bad} should be rejected");
+            assert!(
+                matches!(err, CoreError::Parse(_)),
+                "order={bad} should be rejected"
+            );
         }
     }
 
@@ -285,7 +302,8 @@ mod tests {
     fn order_boundary_values_accepted() {
         for good in ["0", "1", "9999"] {
             let text = format!("---\nid: x\ntitle: t\nlevel: allow\norder: {good}\n---\nb\n");
-            let s = parse_section(&text).unwrap_or_else(|e| panic!("order={good} should be accepted: {e}"));
+            let s = parse_section(&text)
+                .unwrap_or_else(|e| panic!("order={good} should be accepted: {e}"));
             assert_eq!(s.order, good.parse::<i32>().unwrap());
         }
     }

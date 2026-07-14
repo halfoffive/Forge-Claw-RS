@@ -17,7 +17,10 @@ async fn landlock_is_available() -> bool {
     sb.register(Box::new(ShellTool::new(dir.path().to_path_buf())));
 
     let _ = sb
-        .execute("shell", json!({"command": "cd / && touch /tmp/fc_landlock_probe_marker"}))
+        .execute(
+            "shell",
+            json!({"command": "cd / && touch /tmp/fc_landlock_probe_marker"}),
+        )
         .await;
 
     let available = !std::path::Path::new(probe).exists();

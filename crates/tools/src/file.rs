@@ -177,11 +177,7 @@ impl Tool for FileReadTool {
                 }
             };
 
-            let file = match OpenOptions::new()
-                .read(true)
-                .open(&path)
-                .await
-            {
+            let file = match OpenOptions::new().read(true).open(&path).await {
                 Ok(f) => f,
                 Err(e) => {
                     return Ok(ToolResult {
@@ -198,7 +194,9 @@ impl Tool for FileReadTool {
             let real_path = match std::fs::canonicalize(&fd_path) {
                 Ok(p) => p,
                 Err(_) => {
-                    return Ok(blocked("path outside working directory (cannot resolve fd)"));
+                    return Ok(blocked(
+                        "path outside working directory (cannot resolve fd)",
+                    ));
                 }
             };
 
@@ -209,7 +207,11 @@ impl Tool for FileReadTool {
             use tokio::io::AsyncReadExt;
             let tokio_file = tokio::fs::File::from_std(std_file);
             let mut bytes = Vec::new();
-            match tokio_file.take(MAX_READ_BYTES as u64 + 1).read_to_end(&mut bytes).await {
+            match tokio_file
+                .take(MAX_READ_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+            {
                 Ok(_) => Ok(bytes),
                 Err(e) => Err(e),
             }

@@ -460,7 +460,11 @@ mod tests {
     #[test]
     fn safe_join_rejects_path_traversal() {
         let base = PathBuf::from("/tmp/prompts");
-        for bad in ["../../etc/passwd", "../outside", "sections/../../../etc/shadow"] {
+        for bad in [
+            "../../etc/passwd",
+            "../outside",
+            "sections/../../../etc/shadow",
+        ] {
             let rel = PathBuf::from(bad);
             let result = safe_join(&base, &rel);
             assert!(
@@ -498,7 +502,10 @@ mod tests {
     #[test]
     fn sanitize_var_value_strips_template_braces() {
         assert_eq!(sanitize_var_value("/workspace"), "/workspace");
-        assert_eq!(sanitize_var_value("/workspace/{{evil}}/path"), "/workspace/evil/path");
+        assert_eq!(
+            sanitize_var_value("/workspace/{{evil}}/path"),
+            "/workspace/evil/path"
+        );
         assert_eq!(sanitize_var_value("{{injected}}"), "injected");
         assert_eq!(sanitize_var_value("a{{b}}c{{d}}e"), "abcde");
         assert_eq!(sanitize_var_value("normal value"), "normal value");
@@ -511,10 +518,7 @@ mod tests {
         v.insert("tools", "ShellTool".to_string());
         v.insert("model", "deepseek-chat".to_string());
         v.insert("cwd", "/workspace/{{tools}}".to_string());
-        let out = engine
-            .compile("default", &v)
-            .await
-            .expect("compile failed");
+        let out = engine.compile("default", &v).await.expect("compile failed");
         assert!(
             !out.contains("{{tools}}"),
             "injected {{tools}} from cwd should have been sanitized\n{out}"

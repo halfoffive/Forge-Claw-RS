@@ -455,7 +455,10 @@ mod tests {
 
         assert_eq!(h.messages()[0].role, Role::System);
         assert_eq!(h.messages().last().unwrap().content, "final");
-        assert!(h.messages().iter().any(|m| m.role == Role::User && m.content == long_content));
+        assert!(h
+            .messages()
+            .iter()
+            .any(|m| m.role == Role::User && m.content == long_content));
     }
 
     #[test]
@@ -491,15 +494,19 @@ mod tests {
         h.truncate_to_limit();
 
         assert_eq!(h.messages()[0].role, Role::System);
-        let tool_msgs: Vec<_> = h.messages().iter().filter(|m| m.role == Role::Tool).collect();
+        let tool_msgs: Vec<_> = h
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
         for tm in tool_msgs {
             let tc_id = tm.tool_call_id.as_ref().unwrap();
             assert!(
                 h.messages().iter().any(|m| {
                     m.role == Role::Assistant
-                        && m.tool_calls.as_ref().is_some_and(|tcs| {
-                            tcs.iter().any(|tc| tc.id == *tc_id)
-                        })
+                        && m.tool_calls
+                            .as_ref()
+                            .is_some_and(|tcs| tcs.iter().any(|tc| tc.id == *tc_id))
                 }),
                 "tool message {} has no matching assistant tool_call",
                 tc_id
@@ -521,7 +528,11 @@ mod tests {
         h.truncate_to_limit();
 
         let msgs = h.messages();
-        let mut i = if !msgs.is_empty() && msgs[0].role == Role::System { 1 } else { 0 };
+        let mut i = if !msgs.is_empty() && msgs[0].role == Role::System {
+            1
+        } else {
+            0
+        };
         while i < msgs.len() {
             assert_eq!(msgs[i].role, Role::User, "expected user at position {}", i);
             i += 1;
